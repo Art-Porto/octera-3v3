@@ -14,5 +14,6 @@ kyleisah (GPL-3.0) e módulos de terceiros para o Klipper.
 | `config/macros/*`, `config/buzzer-support.cfg`, `config/camera-settings.cfg` | Helper Script | caminhos |
 | `config/improved-shapers/*`, `files/delete_*.sh`, `files/ft2font*.so` | Helper Script | caminhos |
 | `files/useful_macros.sh`, `files/beep.mp3` | Helper Script | nenhuma |
+| `files/system/supervisorctl`, `sudo`, `systemctl` | Helper Script (shim de destinal) | nenhuma |
 | `klippy/extras/gcode_shell_command.py`, `virtual_pins.py`, `calibrate_shaper_config.py` | Helper Script (terceiros) | nenhuma |
 | `klippy/extras/octera_mesh_reuse.py`, `install.sh`, `tests/` | Octera | — |

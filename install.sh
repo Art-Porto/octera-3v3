@@ -68,6 +68,11 @@ for module in octera_mesh_reuse gcode_shell_command virtual_pins calibrate_shape
   link "$target" "$EXTRAS/$module.py"
 done
 
+# --- Service control shims used by Moonraker ------------------------------
+for tool in supervisorctl sudo systemctl; do
+  link "/usr/data/octera/files/system/$tool" "$ROOT/usr/bin/$tool"
+done
+
 # --- Config directory -----------------------------------------------------
 link "/usr/data/octera/config" "$CONFIG/Octera"
 [ -d "$CONFIG/octera-shapers" ] || change "create octera-shapers output folder" mkdir -p "$CONFIG/octera-shapers"
