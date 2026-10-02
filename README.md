@@ -21,18 +21,30 @@ malha reprovada aborta antes de extrudar.
 
 ## Instalação
 
-Na impressora, com Moonraker já instalado:
+Impressora já com Moonraker atualizado (só a camada Octera):
 
-    git clone <url deste repositório> /usr/data/octera
+    git clone https://github.com/Art-Porto/octera-3v3.git /usr/data/octera
     sh /usr/data/octera/install.sh --check   # mostra o que mudaria
     sh /usr/data/octera/install.sh
 
-Depois reinicie o Klipper com a mesa livre. O instalador é idempotente,
-guarda backup de cada arquivo que edita em `/usr/data/octera-backups/` e
-registra o pacote no Update Manager do Moonraker.
+Impressora recém-restaurada de fábrica (base + camada Octera), com acesso
+root habilitado e Wi-Fi configurado:
 
-Para desfazer, restaure `printer.cfg`, `gcode_macro.cfg` e `moonraker.conf`
-do backup e reinicie.
+    git clone https://github.com/Art-Porto/octera-3v3.git /usr/data/octera
+    sh /usr/data/octera/install-base.sh --check
+    sh /usr/data/octera/install-base.sh
+
+`install-base.sh` baixa o pacote base da release indicada em `base/RELEASE`
+(Moonraker com ambiente Python pronto para MIPS e Fluidd), confere o
+SHA-256, liga os serviços e chama `install.sh`. Não inclui OctoEverywhere
+nem OctoApp, que têm instaladores próprios.
+
+Depois reinicie o Klipper com a mesa livre. Os instaladores são idempotentes
+e guardam backup de cada arquivo que editam em `/usr/data/octera-backups/`.
+Atualizações chegam pelo Update Manager do Moonraker; quando uma atualização
+adicionar arquivos novos, rode `install.sh` de novo.
+
+Para desfazer, restaure os arquivos do backup e reinicie.
 
 ## Estrutura
 
@@ -41,6 +53,8 @@ do backup e reinicie.
 | `config/` | fica visível na impressora como `config/Octera/`; `octera.cfg` é o único include |
 | `klippy/extras/` | módulos do Klipper, ligados por link |
 | `files/` | scripts e binários auxiliares |
+| `base/` | serviço e configs do Moonraker/nginx usados por `install-base.sh` |
+| `tools/` | geração do pacote base a partir de uma impressora funcionando |
 | `tests/` | suítes offline (`python tests/run_all.py`, requer `jinja2`) |
 
 Arquivos gerados na impressora ficam fora do repositório

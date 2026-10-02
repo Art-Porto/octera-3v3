@@ -17,3 +17,10 @@ kyleisah (GPL-3.0) e módulos de terceiros para o Klipper.
 | `files/system/supervisorctl`, `sudo`, `systemctl` | Helper Script (shim de destinal) | nenhuma |
 | `klippy/extras/gcode_shell_command.py`, `virtual_pins.py`, `calibrate_shaper_config.py` | Helper Script (terceiros) | nenhuma |
 | `klippy/extras/octera_mesh_reuse.py`, `install.sh`, `tests/` | Octera | — |
+| `base/nginx.conf`, `base/moonraker.asvc`, `files/system/curl` | Helper Script | nenhuma |
+| `base/S56moonraker_service` | Helper Script | cache fora do overlay (`XDG_CACHE_HOME`) |
+| `base/moonraker.conf` | Helper Script | sem entradas do Helper Script |
+
+O pacote base das releases contém o [Moonraker](https://github.com/Arksine/moonraker)
+(GPL-3.0) com seu ambiente Python e o [Fluidd](https://github.com/fluidd-core/fluidd)
+(GPL-3.0), copiados de uma impressora em funcionamento.
