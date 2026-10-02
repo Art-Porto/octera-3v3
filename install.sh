@@ -151,5 +151,6 @@ elif [ "$CHECK" = 1 ]; then
   say "$CHANGES change(s) pending"
 else
   say "$CHANGES change(s) applied; backups in $BACKUP"
-  say "restart Klipper (and Moonraker if the update manager changed) when the bed is clear"
+  say "restart the Klipper SERVICE when the bed is clear (and Moonraker if the"
+  say "update manager changed). The RESTART command does not reload Python modules."
 fi

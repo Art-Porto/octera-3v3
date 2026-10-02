@@ -39,7 +39,8 @@ root habilitado e Wi-Fi configurado:
 SHA-256, liga os serviços e chama `install.sh`. Não inclui OctoEverywhere
 nem OctoApp, que têm instaladores próprios.
 
-Depois reinicie o Klipper com a mesa livre. Os instaladores são idempotentes
+Depois reinicie o serviço do Klipper com a mesa livre (pelo menu de energia
+do Fluidd, "Klipper"; o botão RESTART não recarrega os módulos Python). Os instaladores são idempotentes
 e guardam backup de cada arquivo que editam em `/usr/data/octera-backups/`.
 Atualizações chegam pelo Update Manager do Moonraker; quando uma atualização
 adicionar arquivos novos, rode `install.sh` de novo.

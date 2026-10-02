@@ -19,6 +19,22 @@ import time
 SCHEMA = "octera-kamp-mesh-reuse-v1"
 KNOWN_ALGORITHMS = {"lagrange", "bicubic"}
 COVERAGE_EPSILON_MM = 0.05
+
+
+def _loaded_source_sha256():
+    """Hash of this file as imported, so status shows which code is in memory.
+
+    Klipper's RESTART keeps the Python process and its imported modules; only
+    a service restart loads a new version of this file.
+    """
+    try:
+        with open(__file__.replace(".pyc", ".py"), "rb") as stream:
+            return hashlib.sha256(stream.read()).hexdigest()
+    except Exception:
+        return None
+
+
+MODULE_SHA256 = _loaded_source_sha256()
 REASONS = {
     "REUSE_PASS",
     "REJECT_NO_MESH",
@@ -918,6 +934,7 @@ class OcteraMeshReuse:
             logging.exception("octera_mesh_reuse: status fingerprint failed")
         return {
             "schema": SCHEMA,
+            "module_sha256": MODULE_SHA256,
             "enabled": self.enabled,
             "session_id": self.session_id,
             "metadata": _plain(self.metadata),
