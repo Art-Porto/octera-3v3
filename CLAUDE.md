@@ -8,7 +8,8 @@ Fonte do que é instalado na Ender-3 V3 Plus. Na impressora fica em
   exatamente a grade do macro `BED_MESH_CALIBRATE` em
   `config/kamp/Adaptive_Meshing.cfg`; `tests/test_probe_plan_mirror.py`
   garante isso. Mudou um, mude o outro.
-- Grade sempre quadrada e ímpar; nunca retangular (o PRTouch falha).
+- Grade sempre quadrada; nunca retangular (o PRTouch falha). Grade só
+  ímpar é opcional (`octera_odd_probe_count`).
 - Nada gerado na impressora pode ficar dentro do repositório.
 - Arquivos em `.cfg`, `.py` e `.sh` usam fim de linha LF.
 - Repositório público: sem senhas, IPs, logs ou evidências. O histórico de

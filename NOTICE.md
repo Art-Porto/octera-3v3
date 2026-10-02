@@ -7,7 +7,7 @@ kyleisah (GPL-3.0) e módulos de terceiros para o Klipper.
 
 | Arquivo | Origem | Alteração |
 |---|---|---|
-| `config/kamp/Adaptive_Meshing.cfg` | KAMP / Helper Script | grade independente por eixo, square-max, grade ímpar, estimativa de tempo |
+| `config/kamp/Adaptive_Meshing.cfg` | KAMP / Helper Script | grade independente por eixo, square-max, grade ímpar opcional, estimativa de tempo |
 | `config/kamp/Start_Print.cfg` | Helper Script (`Start_Print-3v3.cfg`) | dispatcher de reuso de malha |
 | `config/kamp/KAMP_Settings.cfg` | Helper Script | parâmetros Octera e seção `[octera_mesh_reuse]` |
 | `config/kamp/Line_Purge.cfg`, `Smart_Park.cfg` | KAMP / Helper Script | nenhuma |

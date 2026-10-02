@@ -14,9 +14,9 @@ parte dele que esta impressora usa, mais as funções Octera.
 | Shapers melhorados e gráficos | Helper Script |
 | `gcode_shell_command`, `virtual_pins` | Helper Script |
 
-Regras da malha adaptativa: a área segue a peça; a grade é sempre quadrada e
-ímpar (3, 5, 7 ou 9 pontos por lado), porque o PRTouch desta impressora
-falha com grade retangular. A malha medida é validada antes do print e uma
+Regras da malha adaptativa: a área segue a peça; a grade é sempre quadrada
+(3 a 9 pontos por lado), porque o PRTouch desta impressora falha com grade
+retangular. `octera_odd_probe_count: 1` restringe a grades ímpares. A malha medida é validada antes do print e uma
 malha reprovada aborta antes de extrudar.
 
 ## Instalação

@@ -154,10 +154,10 @@ def run() -> dict:
         got = pending_count(origin)
         if got != expected:
             failures.append({"origin": origin, "pending_count": got})
-    # Shipped settings: every grid is square, odd and valid for its algorithm.
+    # Odd-only mode: every grid is square, odd and valid for its algorithm.
     for size in sizes:
         polygon = [[150 - size / 2, 150 - size / 2], [150 + size / 2, 150 + size / 2]]
-        plan = module_plan(shipped, [9, 9], polygon)
+        plan = module_plan(dict(shipped, octera_odd_probe_count=1), [9, 9], polygon)
         count, checks = plan["count"], checks + 1
         if (count[0] != count[1] or count[0] % 2 == 0
                 or (count[0] > 6) != (plan["algorithm"] == "bicubic")):
