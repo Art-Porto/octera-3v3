@@ -793,10 +793,31 @@ class OcteraMeshReuse:
                 )
             )
 
+    def _restore_session_profile(self, eventtime):
+        """Reload the profile the session metadata belongs to.
+
+        Creality's homing path loads the "default" profile, so by the time a
+        print reaches the dispatcher the active mesh is usually the boot
+        full-bed mesh, not the adaptive one the metadata describes. The
+        metadata gates still decide whether the reloaded mesh is reused.
+        """
+        meta = self.metadata
+        if not meta or not meta.get("thermal_valid") or self.manual_invalidated:
+            return False
+        name = meta.get("profile_name")
+        status = self.printer.lookup_object("bed_mesh").get_status(eventtime)
+        if (not name or name == status.get("profile_name")
+                or name not in (status.get("profiles") or {})):
+            return False
+        self.gcode.run_script_from_command("BED_MESH_PROFILE LOAD=%s" % name)
+        return True
+
     def cmd_OCTERA_MESH_REUSE_OR_CALIBRATE(self, gcmd):
         eventtime = self.reactor.monotonic()
         bed_target = gcmd.get_float("BED_TARGET", minval=1.0)
         origin = gcmd.get("ORIGIN", "adaptive").lower()
+        if self.enabled and self._restore_session_profile(eventtime):
+            eventtime = self.reactor.monotonic()
         candidate = self._mesh_candidate(eventtime)
         request = self._request(eventtime, bed_target)
         kamp_enabled = int(self._kamp_status(eventtime).get("reuse_loaded_mesh", 1)) == 1
