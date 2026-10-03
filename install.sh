@@ -59,7 +59,7 @@ comment_block() { # comment_block <file> <section header regex>: comment until b
 [ -f "$PRINTER_CFG" ] || { say "printer.cfg not found at $PRINTER_CFG"; exit 1; }
 
 # --- Klipper extras -------------------------------------------------------
-for module in octera_mesh_reuse gcode_shell_command virtual_pins calibrate_shaper_config; do
+for module in octera_mesh_reuse octera_mesh_verify gcode_shell_command virtual_pins calibrate_shaper_config; do
   target="/usr/data/octera/klippy/extras/$module.py"
   if [ -f "$EXTRAS/$module.py" ] && [ ! -L "$EXTRAS/$module.py" ]; then
     backup "$EXTRAS/$module.py"
