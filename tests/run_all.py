@@ -15,6 +15,7 @@ SUITES = [
     "tests/test_profile_restore.py",
     "tests/test_mesh_verify.py",
     "tests/test_verified_reuse.py",
+    "tests/test_install_links.py",
 ]
 
 
