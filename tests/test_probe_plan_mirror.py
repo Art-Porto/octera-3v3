@@ -85,6 +85,7 @@ def pending_count(origin: str) -> list:
     owner = MODULE.OcteraMeshReuse.__new__(MODULE.OcteraMeshReuse)
     owner.reactor = type("R", (), {"monotonic": lambda self: 1.0})()
     owner.enabled, owner.metadata, owner.verbose = True, None, False
+    owner.verify_enabled = False
     owner.mesh_time_base, owner.mesh_time_per_point = 55.0, 4.5
     owner.validation_sequence, owner.manual_invalidated = 0, False
     owner._mesh_candidate = lambda eventtime: {

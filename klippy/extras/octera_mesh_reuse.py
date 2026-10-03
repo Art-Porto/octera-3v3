@@ -15,6 +15,24 @@ import math
 import os
 import time
 
+try:  # Klipper loads extras as a package; the offline tests load by path.
+    from . import octera_mesh_verify as verify_helpers
+except ImportError:  # pragma: no cover - offline import
+    import importlib.util as _ilu
+    _spec = _ilu.spec_from_file_location(
+        "octera_mesh_verify",
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "octera_mesh_verify.py"),
+    )
+    verify_helpers = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(verify_helpers)
+
+STORE_SCHEMA = "octera-mesh-store-v1"
+# CALIBRATE reasons a verified stored mesh may stand in for.
+VERIFIABLE_REASONS = {
+    "REJECT_NO_MESH", "REJECT_METADATA_MISSING", "REJECT_THERMAL_SESSION",
+    "REJECT_COVERAGE", "REJECT_DENSITY", "REJECT_TEMP",
+}
+
 
 SCHEMA = "octera-kamp-mesh-reuse-v1"
 KNOWN_ALGORITHMS = {"lagrange", "bicubic"}
@@ -435,6 +453,16 @@ class OcteraMeshReuse:
         self.mesh_time_base = config.getfloat("mesh_time_base", 55.0, minval=0.0)
         self.mesh_time_per_point = config.getfloat("mesh_time_per_point", 4.5, minval=0.0)
         self.verbose = config.getboolean("verbose", True)
+        # Verified reuse (V2): check a stored mesh with a 3x3 on its nodes.
+        self.verify_enabled = config.getboolean("verify_enabled", False)
+        self.verify_tolerance = config.getfloat(
+            "verify_tolerance", 0.05, minval=0.005, maxval=0.2)
+        self.verify_min_full_count = config.getint("verify_min_full_count", 5, minval=4)
+        self.verify_max_age_hours = config.getfloat("verify_max_age_hours", 168.0, minval=0.0)
+        self.store_path = config.get(
+            "store_path", "/usr/data/printer_data/octera-mesh-store.json")
+        self.pending_verify = None
+        self.last_verify = None
         self.metadata = None
         self.last_decision = {
             "decision": "CALIBRATE", "reason": "REJECT_METADATA_MISSING"
@@ -458,6 +486,11 @@ class OcteraMeshReuse:
             "OCTERA_MESH_METADATA_CAPTURE",
             self.cmd_OCTERA_MESH_METADATA_CAPTURE,
             desc="Capture lateral Octera metadata for the loaded physical mesh",
+        )
+        self.gcode.register_command(
+            "OCTERA_MESH_VERIFY_FINISH",
+            self.cmd_OCTERA_MESH_VERIFY_FINISH,
+            desc="Compare the verification probes with the stored mesh",
         )
         self.gcode.register_command(
             "OCTERA_MESH_INVALIDATE",
@@ -840,6 +873,21 @@ class OcteraMeshReuse:
         if decision["decision"] == "REUSE":
             gcmd.respond_info("REUSING LOADED MESH")
             return
+        if (origin == "adaptive" and self.enabled and kamp_enabled
+                and self.verify_enabled
+                and decision["reason"] in VERIFIABLE_REASONS):
+            plan = self._verify_plan(request, bed_target)
+            self.last_verify = {"timestamp": time.time(), "plan": _plain(
+                {k: v for k, v in plan.items() if k != "store"})}
+            if plan["ok"]:
+                self._start_verification(gcmd, candidate, request, plan, bed_target)
+                return
+            gcmd.respond_info("OCTERA MESH VERIFY skipped: %s" % plan["reason"])
+        self._start_calibration(gcmd, candidate, request, origin,
+                                decision["reason"], bed_target, eventtime)
+
+    def _start_calibration(self, gcmd, candidate, request, origin, reason,
+                           bed_target, eventtime):
         if origin == "full-bed":
             # The stock full-bed routine probes the configured grid, not the
             # adaptive plan; validate the result against what it measures.
@@ -858,11 +906,15 @@ class OcteraMeshReuse:
             gcmd.respond_info("RUNNING FULL-BED CALIBRATION")
         else:
             gcmd.respond_info("RUNNING ADAPTIVE CALIBRATION")
-        self._begin_validation(candidate, request, origin, decision["reason"])
+        self._begin_validation(candidate, request, origin, reason)
         if origin == "full-bed":
+            # CX_PRINT_LEVELING_CALIBRATION calls BED_MESH_CALIBRATE, which KAMP
+            # overrides with the adaptive macro, so it never measured a full
+            # bed and then loaded the stale boot "default" profile. Call the
+            # stock calibration (config mesh_min/max and probe_count) directly.
             script = "\n".join([
                 "BED_MESH_CLEAR",
-                "CX_PRINT_LEVELING_CALIBRATION",
+                "_BED_MESH_CALIBRATE PROFILE=default",
                 "BED_MESH_PROFILE LOAD=default",
                 "OCTERA_MESH_METADATA_CAPTURE BED_TARGET=%.3f ORIGIN=full-bed" % bed_target,
             ])
@@ -921,6 +973,7 @@ class OcteraMeshReuse:
         self.last_invalidation_reason = "REUSE_PASS"
         self.validation_state = "VALID_FOR_REUSE"
         self.pending_validation = None
+        self._write_store(eventtime, candidate, sanity, bed_target, fingerprint)
         gcmd.respond_info(
             "OCTERA_MESH_METADATA_CAPTURED origin=%s probes=%sx%s "
             "bounds=%s bed=%.2f fingerprint=%s" % (
@@ -929,6 +982,175 @@ class OcteraMeshReuse:
                 fingerprint[:16],
             )
         )
+
+    # ----- Verified reuse (V2) -------------------------------------------
+    def _write_store(self, eventtime, candidate, sanity, bed_target, fingerprint):
+        """Persist an accepted mesh so a later session can verify and reuse it."""
+        try:
+            status = self.printer.lookup_object("bed_mesh").get_status(eventtime)
+            profile = (status.get("profiles") or {}).get(candidate["profile_name"]) or {}
+            if not profile.get("points") or not profile.get("mesh_params"):
+                return
+            store = {
+                "schema": STORE_SCHEMA,
+                "saved_at": time.time(),
+                "profile_name": candidate["profile_name"],
+                "bounds": candidate["bounds"],
+                "probe_count": sanity["count"],
+                "spacing": sanity["spacing"],
+                "points": _plain(profile["points"]),
+                "mesh_params": _plain(profile["mesh_params"]),
+                "algorithm": candidate.get("algorithm"),
+                "bed_target": float(bed_target),
+                "config_fingerprint": fingerprint,
+            }
+            tmp = self.store_path + ".tmp"
+            with open(tmp, "w") as stream:
+                json.dump(store, stream, sort_keys=True)
+            os.replace(tmp, self.store_path)
+        except Exception:
+            logging.exception("octera_mesh_reuse: could not write mesh store")
+
+    def _load_store(self):
+        try:
+            with open(self.store_path, "r") as stream:
+                store = json.load(stream)
+        except Exception:
+            return None
+        return store if store.get("schema") == STORE_SCHEMA else None
+
+    def _drop_store(self, reason):
+        try:
+            if os.path.exists(self.store_path):
+                os.replace(self.store_path, self.store_path + ".invalidated")
+        except Exception:
+            logging.exception("octera_mesh_reuse: could not drop mesh store (%s)", reason)
+
+    def _verify_plan(self, request, bed_target):
+        """Decide whether the stored mesh can be checked instead of re-probed."""
+        plan = {"ok": False, "reason": "VERIFY_NO_STORE"}
+        if int(request["required_probe_count"][0]) < self.verify_min_full_count:
+            plan["reason"] = "VERIFY_NOT_WORTH_IT"
+            return plan
+        store = self._load_store()
+        if not store:
+            return plan
+        age_hours = (time.time() - float(store.get("saved_at", 0))) / 3600.0
+        if self.verify_max_age_hours and age_hours > self.verify_max_age_hours:
+            plan["reason"] = "VERIFY_STORE_TOO_OLD"
+            return plan
+        if store.get("config_fingerprint") != request.get("config_fingerprint"):
+            plan["reason"] = "VERIFY_CONFIG_DRIFT"
+            return plan
+        if abs(float(store.get("bed_target", -1000)) - float(bed_target)) > self.bed_temp_tolerance:
+            plan["reason"] = "VERIFY_TEMP"
+            return plan
+        mesh = {"bounds": store["bounds"], "probed_matrix": store["points"],
+                "algorithm": store.get("algorithm")}
+        sanity = mesh_sanity(
+            mesh, max_abs=self.sanity_max_abs, max_range=self.sanity_max_range,
+            max_neighbor_jump=self.sanity_max_neighbor_jump,
+            expected_count=store.get("probe_count"),
+        )
+        if not sanity["pass"]:
+            plan["reason"] = "VERIFY_STORE_SANITY"
+            return plan
+        baseline = request["baseline_spacing"]
+        if (sanity["spacing"][0] > float(baseline[0]) + self.density_epsilon
+                or sanity["spacing"][1] > float(baseline[1]) + self.density_epsilon):
+            plan["reason"] = "VERIFY_DENSITY"
+            return plan
+        grid = verify_helpers.select_verify_grid(
+            store["bounds"], store["probe_count"], request["required_bounds"])
+        if grid is None:
+            plan["reason"] = "VERIFY_NO_GRID"
+            return plan
+        plan.update({"ok": True, "reason": "VERIFY_PLANNED", "grid": grid,
+                     "store": store, "store_sanity": sanity,
+                     "store_age_hours": age_hours})
+        return plan
+
+    def _start_verification(self, gcmd, candidate, request, plan, bed_target):
+        grid = plan["grid"]
+        self.pending_verify = {
+            "candidate": candidate, "request": request, "plan": plan,
+            "bed_target": float(bed_target),
+            "started_at_monotonic": self.reactor.monotonic(),
+        }
+        x0, y0, x1, y1 = grid["bounds"]
+        gcmd.respond_info(
+            "RUNNING MESH VERIFICATION %dx%d on stored %sx%s mesh (age %.1f h)" % (
+                grid["size"], grid["size"], plan["store"]["probe_count"][0],
+                plan["store"]["probe_count"][1], plan["store_age_hours"]))
+        self.gcode.run_script_from_command("\n".join([
+            "BED_MESH_CLEAR",
+            "_BED_MESH_CALIBRATE MESH_MIN=%.3f,%.3f MESH_MAX=%.3f,%.3f "
+            "PROBE_COUNT=%d,%d ALGORITHM=lagrange PROFILE=octera_verify" % (
+                x0, y0, x1, y1, grid["size"], grid["size"]),
+            "OCTERA_MESH_VERIFY_FINISH",
+        ]))
+
+    def _install_profile(self, name, points, mesh_params):
+        bed_mesh = self.printer.lookup_object("bed_mesh")
+        bed_mesh.pmgr.profiles[name] = {
+            "points": [list(row) for row in points],
+            "mesh_params": dict(mesh_params),
+        }
+        self.gcode.run_script_from_command("BED_MESH_PROFILE LOAD=%s" % name)
+
+    def cmd_OCTERA_MESH_VERIFY_FINISH(self, gcmd):
+        pending = self.pending_verify
+        self.pending_verify = None
+        if not pending:
+            raise gcmd.error("OCTERA_MESH_VERIFY_FINISH without a pending verification")
+        eventtime = self.reactor.monotonic()
+        plan = pending["plan"]
+        store = plan["store"]
+        probed = self._mesh_candidate(eventtime).get("probed_matrix") or []
+        result = verify_helpers.compare_verify(
+            store["points"], plan["grid"], probed, self.verify_tolerance)
+        result["duration_sec"] = eventtime - pending["started_at_monotonic"]
+        self.last_verify = {"timestamp": time.time(), "plan": _plain(
+            {k: v for k, v in plan.items() if k != "store"}), "result": _plain(result)}
+        logging.info("octera_mesh_reuse: verify %s", json.dumps(self.last_verify, sort_keys=True))
+        gcmd.respond_info(
+            "OCTERA MESH VERIFY %s max_deviation=%s tolerance=%.3f" % (
+                result["reason"],
+                "n/a" if result["max_deviation"] is None else "%.4f" % result["max_deviation"],
+                self.verify_tolerance))
+        if not result["pass"]:
+            self._start_calibration(
+                gcmd, pending["candidate"], pending["request"], "adaptive",
+                result["reason"], pending["bed_target"], eventtime)
+            return
+        self._install_profile(store["profile_name"], store["points"], store["mesh_params"])
+        eventtime = self.reactor.monotonic()
+        heater = self.printer.lookup_object("heater_bed").get_status(eventtime)
+        fingerprint, components = self._config_fingerprint(eventtime)
+        candidate = self._mesh_candidate(eventtime)
+        self.metadata = {
+            "schema": SCHEMA,
+            "origin": "verified",
+            "profile_name": candidate["profile_name"],
+            "bounds": candidate["bounds"],
+            "probe_count": store["probe_count"],
+            "spacing": plan["store_sanity"]["spacing"],
+            "bed_target": pending["bed_target"],
+            "bed_temperature": float(heater.get("temperature", 0.0)),
+            "creation_timestamp": time.time(),
+            "session_id": self.session_id,
+            "thermal_valid": True,
+            "config_fingerprint": fingerprint,
+            "fingerprint_components": components,
+            "sanity": plan["store_sanity"],
+            "kamp_version": SCHEMA,
+            "verify": result,
+        }
+        self.manual_invalidated = False
+        self.last_invalidation_reason = "REUSE_PASS"
+        self.validation_state = "VALID_FOR_REUSE"
+        gcmd.respond_info("REUSING VERIFIED STORED MESH %sx%s bounds=%s" % (
+            store["probe_count"][0], store["probe_count"][1], candidate["bounds"]))
 
     def cmd_OCTERA_MESH_INVALIDATE(self, gcmd):
         reason = gcmd.get("REASON", "REJECT_MANUAL_INVALIDATION").upper()
@@ -942,6 +1164,7 @@ class OcteraMeshReuse:
             self.metadata["thermal_valid"] = False
             self.metadata["invalidation_reason"] = reason
             self.metadata["invalidated_at"] = time.time()
+        self._drop_store(reason)
         gcmd.respond_info("OCTERA_MESH_INVALIDATED reason=%s" % reason)
 
     def cmd_OCTERA_MESH_REUSE_STATUS(self, gcmd):
@@ -965,6 +1188,8 @@ class OcteraMeshReuse:
             "validation_state": self.validation_state,
             "pending_validation": _plain(self.pending_validation),
             "last_rejection": _plain(self.last_rejection),
+            "verify_enabled": self.verify_enabled,
+            "last_verify": _plain(self.last_verify),
             "current_config_fingerprint": fingerprint,
             "policy": _plain(self._policy()),
         }
