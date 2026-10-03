@@ -12,6 +12,7 @@ SUITES = [
     "tests/test_probe_plan_mirror.py",
     "tests/test_mesh_reuse_v1.py",
     "tests/test_mesh_reuse_hardening.py",
+    "tests/test_mesh_verify.py",
 ]
 
 
