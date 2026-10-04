@@ -25,7 +25,9 @@ BACKUP="$DATA/octera-backups/base_$(date +%Y%m%d_%H%M%S)"
 ASSET=octera-base-3v3.tar.gz
 ASSET_URL="${OCTERA_BASE_URL:-https://github.com/Art-Porto/octera-3v3/releases/download/$(cat "$REPO/base/RELEASE")/$ASSET}"
 CHECK=0
-[ "$1" = "--check" ] && CHECK=1
+for arg in "$@"; do
+  [ "$arg" = "--check" ] && CHECK=1
+done
 CHANGES=0
 
 say() { echo "octera-base: $*"; }
@@ -128,11 +130,8 @@ if [ ! -f "$DATA/printer_data/moonraker.asvc" ]; then
 fi
 
 # --- Octera layer ---------------------------------------------------------
-if [ "$CHECK" = 1 ]; then
-  sh "$REPO/install.sh" --check
-else
-  sh "$REPO/install.sh"
-fi
+# Arguments such as --check and --lis2dw are passed through.
+sh "$REPO/install.sh" "$@"
 
 # --- Services -------------------------------------------------------------
 if [ "$CHECK" = 0 ]; then

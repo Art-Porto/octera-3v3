@@ -3,6 +3,9 @@
 #
 #   sh /usr/data/octera/install.sh            install or refresh the Octera layer
 #   sh /usr/data/octera/install.sh --check    report what would change, touch nothing
+#   sh /usr/data/octera/install.sh --lis2dw   also switch the accelerometers to LIS2DW
+#                                             (boards whose ACCELEROMETER_QUERY fails
+#                                             with "Invalid adxl345 id")
 #
 # Idempotent: running it twice changes nothing the second time. Every file it
 # edits is copied to /usr/data/octera-backups/install_<timestamp>/ first.
@@ -23,7 +26,13 @@ MATPLOTLIB="$ROOT/usr/lib/python3.8/site-packages/matplotlib"
 BACKUP="$ROOT/usr/data/octera-backups/install_$(date +%Y%m%d_%H%M%S)"
 ORIGIN="${OCTERA_ORIGIN:-$(git -C "$REPO" config --get remote.origin.url 2>/dev/null || true)}"
 CHECK=0
-[ "$1" = "--check" ] && CHECK=1
+LIS2DW=0
+for arg in "$@"; do
+  case "$arg" in
+    --check) CHECK=1 ;;
+    --lis2dw) LIS2DW=1 ;;
+  esac
+done
 CHANGES=0
 
 say() { echo "octera: $*"; }
@@ -96,6 +105,43 @@ if ! grep -q "^\[include Octera/octera.cfg\]" "$PRINTER_CFG"; then
   backup "$PRINTER_CFG"
   change "include Octera/octera.cfg in printer.cfg" \
     sed -i '/^\[include printer_params\.cfg\]/a [include Octera/octera.cfg]' "$PRINTER_CFG"
+fi
+# The adaptive plan and the full-bed fallback assume a 9x9 cap (33.75 mm).
+if sed -n '/^\[bed_mesh\]/,/^\[/p' "$PRINTER_CFG" | grep -q '^probe_count' \
+    && ! sed -n '/^\[bed_mesh\]/,/^\[/p' "$PRINTER_CFG" | grep -q '^probe_count:[[:space:]]*9,[[:space:]]*9'; then
+  backup "$PRINTER_CFG"
+  change "set bed_mesh probe_count to 9,9" \
+    sed -i '/^\[bed_mesh\]/,/^\[/ s/^probe_count:.*/probe_count:9,9/' "$PRINTER_CFG"
+fi
+# Newer boards carry LIS2DW accelerometers although printer.cfg says adxl345.
+if [ "$LIS2DW" = 1 ] && grep -q '^\[adxl345 adx_[xy]\]' "$PRINTER_CFG"; then
+  backup "$PRINTER_CFG"
+  to_lis2dw() {
+    sed -i \
+      -e 's/^\[adxl345 adx_x\]/[lis2dw adx_x]/' \
+      -e 's/^\[adxl345 adx_y\]/[lis2dw adx_y]/' \
+      -e 's/^accel_chip_x:[[:space:]]*adxl345 adx_x/accel_chip_x:lis2dw adx_x/' \
+      -e 's/^accel_chip_y:[[:space:]]*adxl345 adx_y/accel_chip_y:lis2dw adx_y/' \
+      -e '/^\[lis2dw adx_[xy]\]/,/^$/ s/^spi_speed:.*/spi_speed: 5000000/' \
+      -e '/^\[lis2dw adx_y\]/,/^$/ s/^axes_map:.*/axes_map: x,y,z/' \
+      "$PRINTER_CFG"
+  }
+  change "switch accelerometers to lis2dw" to_lis2dw
+fi
+# Printer-specific settings (input shaper, overrides) live outside the repo.
+if [ ! -f "$CONFIG/octera-local.cfg" ]; then
+  local_cfg() {
+    printf '%s\n' \
+      '# Settings specific to this printer; included by Octera/octera.cfg.' \
+      '# Not part of the octera repository, so updates never touch it.' \
+      '# Example, after measuring with TEST_RESONANCES_GRAPHS:' \
+      '#[input_shaper]' \
+      '#shaper_type_x: mzv' \
+      '#shaper_freq_x: 50.0' \
+      '#shaper_type_y: mzv' \
+      '#shaper_freq_y: 50.0' > "$CONFIG/octera-local.cfg"
+  }
+  change "create octera-local.cfg for printer-specific settings" local_cfg
 fi
 # M600 support owns the filament sensor and the idle timeout.
 comment_block "$PRINTER_CFG" '\[idle_timeout\]'
