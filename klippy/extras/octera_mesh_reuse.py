@@ -30,7 +30,7 @@ STORE_SCHEMA = "octera-mesh-store-v1"
 # CALIBRATE reasons a verified stored mesh may stand in for.
 VERIFIABLE_REASONS = {
     "REJECT_NO_MESH", "REJECT_METADATA_MISSING", "REJECT_THERMAL_SESSION",
-    "REJECT_COVERAGE", "REJECT_DENSITY", "REJECT_TEMP",
+    "REJECT_COVERAGE", "REJECT_DENSITY", "REJECT_TEMP", "REJECT_MESH_CHANGED",
 }
 
 
@@ -65,6 +65,7 @@ REASONS = {
     "REJECT_SANITY_MESH_CLEARED",
     "REJECT_SANITY_CLEAR_FAILED",
     "REJECT_METADATA_MISSING",
+    "REJECT_MESH_CHANGED",
     "REJECT_MANUAL_INVALIDATION",
     "REJECT_PRINTER_STATE",
     "REJECT_UNKNOWN",
@@ -374,7 +375,9 @@ def evaluate_reuse(candidate, metadata, request, policy):
     )
     decision["gates"]["metadata_mesh_match"] = metadata_match
     if not metadata_match:
-        decision["reason"] = "REJECT_METADATA_MISSING"
+        # The loaded mesh is not the one the metadata describes: something
+        # outside this module replaced it (homing, a manual profile load).
+        decision["reason"] = "REJECT_MESH_CHANGED"
         return decision
     required = [float(value) for value in request["required_bounds"]]
     coverage = (

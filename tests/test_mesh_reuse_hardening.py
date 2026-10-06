@@ -210,6 +210,20 @@ def run() -> dict:
         == "REJECT_METADATA_MISSING",
         "restart_or_stale_metadata_cannot_reuse",
     )
+    # A mesh loaded from outside the module (homing loads "default") does not
+    # match the metadata and must be reported as changed, not as missing.
+    flat = [[0.0] * 9 for _ in range(9)]
+    swapped = {"probed_matrix": flat, "bounds": [15.0, 15.0, 285.0, 285.0],
+               "algorithm": "bicubic"}
+    stale = {"bounds": [100.0, 100.0, 200.0, 200.0], "probe_count": [5, 5],
+             "thermal_valid": True, "session_id": "s", "config_fingerprint": "f"}
+    changed = MODULE.evaluate_reuse(
+        swapped, stale,
+        {"manual_invalidated": False, "session_id": "s", "config_fingerprint": "f"},
+        policy,
+    )
+    require(changed["reason"] == "REJECT_MESH_CHANGED", "external_mesh_change_named", changed)
+    require("REJECT_MESH_CHANGED" in MODULE.VERIFIABLE_REASONS, "mesh_changed_is_verifiable")
 
     source = MODULE_PATH.read_text(encoding="utf-8")
     adaptive_block = source[source.index('else:\n            script = "\\n".join(['):]
