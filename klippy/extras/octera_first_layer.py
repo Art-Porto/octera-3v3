@@ -201,13 +201,15 @@ class OcteraFirstLayer:
         scanner = FirstLayerScanner()
         read = 0
         rest = ""
-        with open(path, "r", encoding="utf-8", errors="replace") as stream:
+        # Binary: file_position is a byte offset into the file.
+        with open(path, "rb") as stream:
             stream.seek(position)
             while not scanner.done and read < self.max_bytes:
-                data = stream.read(self.chunk)
-                if not data:
+                raw = stream.read(self.chunk)
+                if not raw:
                     break
-                read += len(data)
+                read += len(raw)
+                data = raw.decode("utf-8", errors="replace")
                 lines = (rest + data).split("\n")
                 rest = lines.pop()
                 for line in lines:
