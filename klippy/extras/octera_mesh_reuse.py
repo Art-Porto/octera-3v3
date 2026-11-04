@@ -1,9 +1,18 @@
-"""Octera KAMP Mesh Reuse V1 for the Creality Ender-3 V3 Plus.
+"""Octera KAMP mesh reuse for the Creality Ender-3 V3 Plus.
+
+V1: the session mesh is reused without probing only while its metadata,
+which lives in memory, is valid (same Klipper process, bed still warm, same
+config fingerprint, covers the part).  A restart can never reuse a stale
+mesh without probing.
+
+V2/V3: every accepted mesh is also kept on disk, grouped by bed temperature,
+several areas per temperature and with no age limit.  When V1 refuses, the
+smallest stored mesh that covers the part is checked against the real bed
+with a 3x3 on its own nodes and reused only if every node agrees.  Each
+decision is kept in a short history that survives restarts.
 
 The decision engine is intentionally independent from Klipper so the exact
-live policy can be exercised with offline fixtures.  Runtime metadata is kept
-only in memory: a Klipper/FIRMWARE_RESTART therefore starts a new session and
-can never reuse a stale mesh from an earlier boot.
+live policy can be exercised with offline fixtures.
 """
 
 from __future__ import annotations
@@ -26,7 +35,14 @@ except ImportError:  # pragma: no cover - offline import
     verify_helpers = _ilu.module_from_spec(_spec)
     _spec.loader.exec_module(verify_helpers)
 
-STORE_SCHEMA = "octera-mesh-store-v1"
+STORE_SCHEMA = "octera-mesh-store-v2"
+STORE_SCHEMA_V1 = "octera-mesh-store-v1"
+# Decisions kept in the store file, and how many of them get_status shows.
+HISTORY_LIMIT = 40
+STATUS_HISTORY = 20
+# Every verified mesh is installed under this profile name, so the stock
+# "default" profile in memory is never replaced by a stored copy.
+VERIFIED_PROFILE = "adaptive"
 # CALIBRATE reasons a verified stored mesh may stand in for.
 VERIFIABLE_REASONS = {
     "REJECT_NO_MESH", "REJECT_METADATA_MISSING", "REJECT_THERMAL_SESSION",
@@ -429,6 +445,155 @@ def evaluate_reuse(candidate, metadata, request, policy):
     return decision
 
 
+# ----- Mesh store (V3): pure helpers -----------------------------------------
+def temperature_key(bed_target):
+    return str(int(round(float(bed_target))))
+
+
+def bounds_cover(outer, inner, epsilon=COVERAGE_EPSILON_MM):
+    return (float(outer[0]) <= float(inner[0]) + epsilon
+            and float(outer[1]) <= float(inner[1]) + epsilon
+            and float(outer[2]) >= float(inner[2]) - epsilon
+            and float(outer[3]) >= float(inner[3]) - epsilon)
+
+
+def bounds_area(bounds):
+    return (float(bounds[2]) - float(bounds[0])) * (float(bounds[3]) - float(bounds[1]))
+
+
+def empty_store():
+    return {"schema": STORE_SCHEMA, "entries": [], "history": [], "next_id": 1}
+
+
+def entry_is_wellformed(entry):
+    """Shape check only; mesh_sanity still runs before an entry is used."""
+    try:
+        bounds = [float(value) for value in entry["bounds"]]
+        count = [int(entry["probe_count"][0]), int(entry["probe_count"][1])]
+        points = entry["points"]
+        if len(bounds) != 4 or not all(math.isfinite(v) for v in bounds):
+            return False
+        if bounds[0] >= bounds[2] or bounds[1] >= bounds[3]:
+            return False
+        if len(points) != count[1] or any(len(row) != count[0] for row in points):
+            return False
+        for row in points:
+            for value in row:
+                if not math.isfinite(float(value)):
+                    return False
+        if not isinstance(entry["mesh_params"], dict):
+            return False
+        if not isinstance(entry["config_fingerprint"], str):
+            return False
+        float(entry["bed_target"])
+        float(entry["saved_at"])
+    except (KeyError, IndexError, TypeError, ValueError):
+        return False
+    return True
+
+
+def normalize_store(data):
+    """Return a v2 store from whatever was on disk; never raises.
+
+    A v1 store (one mesh, the V2 format) becomes the first entry.
+    """
+    store = empty_store()
+    if not isinstance(data, dict):
+        return store
+    if data.get("schema") == STORE_SCHEMA_V1:
+        entry = {key: value for key, value in data.items() if key != "schema"}
+        entry.setdefault("uses", 0)
+        entry.setdefault("last_used", entry.get("saved_at"))
+        entry.setdefault("origin", "adaptive")
+        entry["id"] = 1
+        if entry_is_wellformed(entry):
+            store["entries"].append(entry)
+            store["next_id"] = 2
+        return store
+    if data.get("schema") != STORE_SCHEMA:
+        return store
+    entries = data.get("entries")
+    if isinstance(entries, list):
+        store["entries"] = [entry for entry in entries
+                            if isinstance(entry, dict) and entry_is_wellformed(entry)]
+    history = data.get("history")
+    if isinstance(history, list):
+        store["history"] = [item for item in history
+                            if isinstance(item, dict)][-HISTORY_LIMIT:]
+    used = [int(entry.get("id", 0) or 0) for entry in store["entries"]]
+    try:
+        next_id = int(data.get("next_id", 1))
+    except (TypeError, ValueError):
+        next_id = 1
+    store["next_id"] = max([next_id] + [value + 1 for value in used])
+    return store
+
+
+def store_add_entry(store, entry, max_per_temperature, bed_temp_tolerance):
+    """Add a freshly probed mesh; returns the ids it replaced and evicted.
+
+    Entries probed under another config fingerprint can never be used
+    again and go.  A new mesh replaces the stored ones it covers at the same
+    temperature: they describe a part of the same bed and are older.  Past
+    the per-temperature limit, the least recently used entry goes.
+    """
+    fingerprint = entry["config_fingerprint"]
+    target = float(entry["bed_target"])
+    kept, replaced, evicted = [], [], []
+    for other in store["entries"]:
+        if other.get("config_fingerprint") != fingerprint:
+            evicted.append(other.get("id"))
+        elif (abs(float(other["bed_target"]) - target) <= float(bed_temp_tolerance)
+              and bounds_cover(entry["bounds"], other["bounds"])):
+            replaced.append(other.get("id"))
+        else:
+            kept.append(other)
+    entry = dict(entry)
+    entry["id"] = int(store.get("next_id", 1))
+    store["next_id"] = entry["id"] + 1
+    entry.setdefault("uses", 0)
+    entry.setdefault("last_used", entry["saved_at"])
+    key = temperature_key(target)
+    same = [other for other in kept if temperature_key(other["bed_target"]) == key]
+    excess = len(same) + 1 - int(max_per_temperature)
+    if excess > 0:
+        oldest = sorted(same, key=lambda other: float(other.get("last_used") or 0.0))
+        gone = set(id(other) for other in oldest[:excess])
+        evicted.extend(other.get("id") for other in oldest[:excess])
+        kept = [other for other in kept if id(other) not in gone]
+    kept.append(entry)
+    store["entries"] = kept
+    return {"id": entry["id"], "replaced": replaced, "evicted": evicted}
+
+
+def store_find(store, entry_id):
+    for entry in store["entries"]:
+        if entry.get("id") == entry_id:
+            return entry
+    return None
+
+
+def store_forget(store, entry_id):
+    before = len(store["entries"])
+    store["entries"] = [entry for entry in store["entries"]
+                        if entry.get("id") != entry_id]
+    return before - len(store["entries"])
+
+
+def store_summary(store):
+    return [{
+        "id": entry.get("id"),
+        "bed_target": entry.get("bed_target"),
+        "bounds": [round(float(value), 1) for value in entry["bounds"]],
+        "probe_count": entry.get("probe_count"),
+        "origin": entry.get("origin"),
+        "uses": entry.get("uses", 0),
+        "saved_at": entry.get("saved_at"),
+        "last_used": entry.get("last_used"),
+    } for entry in sorted(store["entries"], key=lambda e: (
+        float(e["bed_target"]), bounds_area(e["bounds"])))]
+
+
 class OcteraMeshReuse:
     """Klipper adapter around the pure decision engine."""
 
@@ -461,9 +626,13 @@ class OcteraMeshReuse:
         self.verify_tolerance = config.getfloat(
             "verify_tolerance", 0.05, minval=0.005, maxval=0.2)
         self.verify_min_full_count = config.getint("verify_min_full_count", 5, minval=4)
-        self.verify_max_age_hours = config.getfloat("verify_max_age_hours", 168.0, minval=0.0)
+        # 0 means no age limit (V3): a stored mesh is always checked first.
+        self.verify_max_age_hours = config.getfloat("verify_max_age_hours", 0.0, minval=0.0)
+        self.max_meshes = config.getint("max_meshes_per_temperature", 6, minval=1)
         self.store_path = config.get(
             "store_path", "/usr/data/printer_data/octera-mesh-store.json")
+        self._store_data = None
+        self._history_open = None
         self.pending_verify = None
         self.last_verify = None
         self.metadata = None
@@ -504,6 +673,11 @@ class OcteraMeshReuse:
             "OCTERA_MESH_REUSE_STATUS",
             self.cmd_OCTERA_MESH_REUSE_STATUS,
             desc="Report Octera mesh metadata and the last reuse decision",
+        )
+        self.gcode.register_command(
+            "OCTERA_MESH_HISTORY",
+            self.cmd_OCTERA_MESH_HISTORY,
+            desc="List the stored meshes and the last mesh decisions",
         )
 
     def _session_identifier(self):
@@ -693,6 +867,8 @@ class OcteraMeshReuse:
         }
         self.metadata = None
         self.last_rejection = evidence
+        self._history_close("REJECTED", {
+            "failure_codes": list(sanity.get("failure_codes") or [])})
         logging.error(
             "OCTERA_MESH_REJECTED_EVIDENCE_PENDING_CLEAR %s",
             json.dumps(evidence, sort_keys=True, separators=(",", ":")),
@@ -852,6 +1028,7 @@ class OcteraMeshReuse:
         eventtime = self.reactor.monotonic()
         bed_target = gcmd.get_float("BED_TARGET", minval=1.0)
         origin = gcmd.get("ORIGIN", "adaptive").lower()
+        self.last_verify = None
         if self.enabled and self._restore_session_profile(eventtime):
             eventtime = self.reactor.monotonic()
         candidate = self._mesh_candidate(eventtime)
@@ -875,13 +1052,18 @@ class OcteraMeshReuse:
         self._respond_decision(gcmd, candidate, request, decision)
         if decision["decision"] == "REUSE":
             gcmd.respond_info("REUSING LOADED MESH")
+            self._history_add({
+                "result": "REUSED_SESSION", "reason": decision["reason"],
+                "origin": origin, "bed_target": float(bed_target),
+                "required": request.get("required_bounds"), "probes": 0,
+            })
             return
         if (origin == "adaptive" and self.enabled and kamp_enabled
                 and self.verify_enabled
                 and decision["reason"] in VERIFIABLE_REASONS):
             plan = self._verify_plan(request, bed_target)
-            self.last_verify = {"timestamp": time.time(), "plan": _plain(
-                {k: v for k, v in plan.items() if k != "store"})}
+            self.last_verify = {"timestamp": time.time(),
+                                "plan": self._plan_summary(plan)}
             if plan["ok"]:
                 self._start_verification(gcmd, candidate, request, plan, bed_target)
                 return
@@ -910,6 +1092,20 @@ class OcteraMeshReuse:
         else:
             gcmd.respond_info("RUNNING ADAPTIVE CALIBRATION")
         self._begin_validation(candidate, request, origin, reason)
+        item = {
+            "result": "CALIBRATING", "reason": reason, "origin": origin,
+            "bed_target": float(bed_target),
+            "required": request.get("required_bounds"),
+            "probes": int(request.get("required_probe_points") or 0),
+        }
+        verify = getattr(self, "last_verify", None) or {}
+        if str(reason).startswith("VERIFY_") and verify.get("result"):
+            item["deviation"] = verify["result"].get("max_deviation")
+            item["probes"] += len(verify["result"].get("deviations") or [])
+            item["checked_id"] = (verify.get("plan") or {}).get("entry_id")
+        elif verify.get("plan") and not (verify["plan"] or {}).get("ok"):
+            item["verify_skipped"] = verify["plan"].get("reason")
+        self._history_open = self._history_add(item)
         if origin == "full-bed":
             # CX_PRINT_LEVELING_CALIBRATION calls BED_MESH_CALIBRATE, which KAMP
             # overrides with the adaptive macro, so it never measured a full
@@ -976,27 +1172,108 @@ class OcteraMeshReuse:
         self.last_invalidation_reason = "REUSE_PASS"
         self.validation_state = "VALID_FOR_REUSE"
         self.pending_validation = None
-        self._write_store(eventtime, candidate, sanity, bed_target, fingerprint)
+        stored = self._write_store(eventtime, candidate, sanity, bed_target,
+                                   fingerprint, origin) or {}
+        self._history_close("PROBED", {
+            "mesh_id": stored.get("id"),
+            "replaced": stored.get("replaced") or [],
+            "evicted": stored.get("evicted") or [],
+            "count": sanity["count"],
+        })
         gcmd.respond_info(
             "OCTERA_MESH_METADATA_CAPTURED origin=%s probes=%sx%s "
-            "bounds=%s bed=%.2f fingerprint=%s" % (
+            "bounds=%s bed=%.2f fingerprint=%s stored_id=%s replaced=%s" % (
                 origin, sanity["count"][0], sanity["count"][1],
                 candidate["bounds"], self.metadata["bed_temperature"],
-                fingerprint[:16],
+                fingerprint[:16], stored.get("id"), stored.get("replaced") or [],
             )
         )
 
-    # ----- Verified reuse (V2) -------------------------------------------
-    def _write_store(self, eventtime, candidate, sanity, bed_target, fingerprint):
-        """Persist an accepted mesh so a later session can verify and reuse it."""
+    # ----- Mesh store and verified reuse (V2/V3) ---------------------------
+    def _store(self):
+        """The store, read from disk once per process and kept in memory."""
+        if getattr(self, "_store_data", None) is None:
+            self._store_data = self._load_store()
+        return self._store_data
+
+    def _load_store(self):
+        try:
+            with open(self.store_path, "r") as stream:
+                data = json.load(stream)
+        except Exception:
+            data = None
+        return normalize_store(data)
+
+    def _save_store(self):
+        try:
+            store = self._store()
+            payload = {
+                "schema": STORE_SCHEMA,
+                "next_id": store.get("next_id", 1),
+                "entries": _plain(store["entries"]),
+                "history": _plain(store["history"][-HISTORY_LIMIT:]),
+            }
+            tmp = self.store_path + ".tmp"
+            with open(tmp, "w") as stream:
+                json.dump(payload, stream, sort_keys=True)
+            os.replace(tmp, self.store_path)
+        except Exception:
+            logging.exception("octera_mesh_reuse: could not write mesh store")
+
+    def _history_add(self, item):
+        """Append one decision to the persistent history; never raises."""
+        try:
+            store = self._store()
+            history = store["history"]
+            sequence = int(history[-1].get("seq", 0) or 0) + 1 if history else 1
+            entry = {"seq": sequence, "time": round(time.time(), 1)}
+            entry.update(_plain(item))
+            if entry.get("required"):
+                entry["required"] = [round(float(v), 1) for v in entry["required"]]
+            if isinstance(entry.get("deviation"), float):
+                entry["deviation"] = round(entry["deviation"], 4)
+            history.append(entry)
+            del history[:-HISTORY_LIMIT]
+            self._save_store()
+            logging.info("octera_mesh_reuse: history %s", json.dumps(entry, sort_keys=True))
+            return sequence
+        except Exception:
+            logging.exception("octera_mesh_reuse: could not record history")
+            return None
+
+    def _history_close(self, result, fields):
+        """Finish the open CALIBRATING item, or add one if none is open."""
+        try:
+            sequence = getattr(self, "_history_open", None)
+            self._history_open = None
+            store = self._store()
+            for item in reversed(store["history"]):
+                if sequence is not None and item.get("seq") == sequence:
+                    item["result"] = result
+                    item.update(_plain(fields))
+                    self._save_store()
+                    return
+            item = {"result": result}
+            item.update(fields)
+            self._history_add(item)
+        except Exception:
+            logging.exception("octera_mesh_reuse: could not close history item")
+
+    def _write_store(self, eventtime, candidate, sanity, bed_target, fingerprint,
+                     origin="adaptive"):
+        """Keep an accepted mesh so a later print can verify and reuse it."""
         try:
             status = self.printer.lookup_object("bed_mesh").get_status(eventtime)
             profile = (status.get("profiles") or {}).get(candidate["profile_name"]) or {}
             if not profile.get("points") or not profile.get("mesh_params"):
-                return
-            store = {
-                "schema": STORE_SCHEMA,
-                "saved_at": time.time(),
+                return None
+            heater = self.printer.lookup_object("heater_bed").get_status(eventtime)
+            now = time.time()
+            entry = {
+                "saved_at": now,
+                "last_used": now,
+                "uses": 0,
+                "origin": origin,
                 "profile_name": candidate["profile_name"],
                 "bounds": candidate["bounds"],
                 "probe_count": sanity["count"],
@@ -1005,72 +1282,112 @@ class OcteraMeshReuse:
                 "mesh_params": _plain(profile["mesh_params"]),
                 "algorithm": candidate.get("algorithm"),
                 "bed_target": float(bed_target),
+                "bed_temperature": float(heater.get("temperature", 0.0)),
                 "config_fingerprint": fingerprint,
             }
-            tmp = self.store_path + ".tmp"
-            with open(tmp, "w") as stream:
-                json.dump(store, stream, sort_keys=True)
-            os.replace(tmp, self.store_path)
+            if not entry_is_wellformed(entry):
+                return None
+            result = store_add_entry(
+                self._store(), entry, getattr(self, "max_meshes", 6),
+                self.bed_temp_tolerance)
+            self._save_store()
+            return result
         except Exception:
             logging.exception("octera_mesh_reuse: could not write mesh store")
-
-    def _load_store(self):
-        try:
-            with open(self.store_path, "r") as stream:
-                store = json.load(stream)
-        except Exception:
             return None
-        return store if store.get("schema") == STORE_SCHEMA else None
 
-    def _drop_store(self, reason):
+    def _drop_store(self, reason, bed_target=None):
+        """Drop stored meshes (all, or one temperature); history is kept."""
         try:
             if os.path.exists(self.store_path):
-                os.replace(self.store_path, self.store_path + ".invalidated")
+                with open(self.store_path, "rb") as source:
+                    data = source.read()
+                with open(self.store_path + ".invalidated", "wb") as target:
+                    target.write(data)
+            store = self._store()
+            before = len(store["entries"])
+            if bed_target is None:
+                store["entries"] = []
+            else:
+                key = temperature_key(bed_target)
+                store["entries"] = [entry for entry in store["entries"]
+                                    if temperature_key(entry["bed_target"]) != key]
+            removed = before - len(store["entries"])
+            self._history_add({
+                "result": "INVALIDATED", "reason": reason, "removed": removed,
+                "bed_target": None if bed_target is None else float(bed_target),
+            })
+            return removed
         except Exception:
             logging.exception("octera_mesh_reuse: could not drop mesh store (%s)", reason)
+            return 0
+
+    def _check_entry(self, entry, request, bed_target, now):
+        """Why a stored mesh cannot be verified for this request, or its plan."""
+        if self.verify_max_age_hours:
+            age_hours = (now - float(entry.get("saved_at", 0))) / 3600.0
+            if age_hours > self.verify_max_age_hours:
+                return "VERIFY_STORE_TOO_OLD", None
+        if entry.get("config_fingerprint") != request.get("config_fingerprint"):
+            return "VERIFY_CONFIG_DRIFT", None
+        if abs(float(entry.get("bed_target", -1000)) - float(bed_target)) > self.bed_temp_tolerance:
+            return "VERIFY_TEMP", None
+        mesh = {"bounds": entry["bounds"], "probed_matrix": entry["points"],
+                "algorithm": entry.get("algorithm")}
+        sanity = mesh_sanity(
+            mesh, max_abs=self.sanity_max_abs, max_range=self.sanity_max_range,
+            max_neighbor_jump=self.sanity_max_neighbor_jump,
+            expected_count=entry.get("probe_count"),
+        )
+        if not sanity["pass"]:
+            return "VERIFY_STORE_SANITY", None
+        baseline = request["baseline_spacing"]
+        if (sanity["spacing"][0] > float(baseline[0]) + self.density_epsilon
+                or sanity["spacing"][1] > float(baseline[1]) + self.density_epsilon):
+            return "VERIFY_DENSITY", None
+        grid = verify_helpers.select_verify_grid(
+            entry["bounds"], entry["probe_count"], request["required_bounds"])
+        if grid is None:
+            return "VERIFY_NO_GRID", None
+        return None, {"grid": grid, "store_sanity": sanity}
 
     def _verify_plan(self, request, bed_target):
-        """Decide whether the stored mesh can be checked instead of re-probed."""
+        """Pick the stored mesh to check instead of probing the whole area.
+
+        Among the stored meshes that pass every gate and cover the part, the
+        smallest was probed closest to it; ties go to the most recently used.
+        """
         plan = {"ok": False, "reason": "VERIFY_NO_STORE"}
         if int(request["required_probe_count"][0]) < self.verify_min_full_count:
             plan["reason"] = "VERIFY_NOT_WORTH_IT"
             return plan
-        store = self._load_store()
-        if not store:
+        entries = self._store()["entries"]
+        if not entries:
             return plan
-        age_hours = (time.time() - float(store.get("saved_at", 0))) / 3600.0
-        if self.verify_max_age_hours and age_hours > self.verify_max_age_hours:
-            plan["reason"] = "VERIFY_STORE_TOO_OLD"
+        now = time.time()
+        refusals, usable = {}, []
+        for entry in entries:
+            try:
+                reason, checked = self._check_entry(entry, request, bed_target, now)
+            except Exception:
+                logging.exception("octera_mesh_reuse: stored mesh %s unusable", entry.get("id"))
+                reason, checked = "VERIFY_STORE_ERROR", None
+            if reason:
+                refusals[reason] = refusals.get(reason, 0) + 1
+            else:
+                usable.append((entry, checked))
+        plan["refusals"] = refusals
+        if not usable:
+            plan["reason"] = (list(refusals)[0] if len(refusals) == 1
+                              else "VERIFY_NO_MATCH")
             return plan
-        if store.get("config_fingerprint") != request.get("config_fingerprint"):
-            plan["reason"] = "VERIFY_CONFIG_DRIFT"
-            return plan
-        if abs(float(store.get("bed_target", -1000)) - float(bed_target)) > self.bed_temp_tolerance:
-            plan["reason"] = "VERIFY_TEMP"
-            return plan
-        mesh = {"bounds": store["bounds"], "probed_matrix": store["points"],
-                "algorithm": store.get("algorithm")}
-        sanity = mesh_sanity(
-            mesh, max_abs=self.sanity_max_abs, max_range=self.sanity_max_range,
-            max_neighbor_jump=self.sanity_max_neighbor_jump,
-            expected_count=store.get("probe_count"),
-        )
-        if not sanity["pass"]:
-            plan["reason"] = "VERIFY_STORE_SANITY"
-            return plan
-        baseline = request["baseline_spacing"]
-        if (sanity["spacing"][0] > float(baseline[0]) + self.density_epsilon
-                or sanity["spacing"][1] > float(baseline[1]) + self.density_epsilon):
-            plan["reason"] = "VERIFY_DENSITY"
-            return plan
-        grid = verify_helpers.select_verify_grid(
-            store["bounds"], store["probe_count"], request["required_bounds"])
-        if grid is None:
-            plan["reason"] = "VERIFY_NO_GRID"
-            return plan
-        plan.update({"ok": True, "reason": "VERIFY_PLANNED", "grid": grid,
-                     "store": store, "store_sanity": sanity,
-                     "store_age_hours": age_hours})
+        entry, checked = min(usable, key=lambda pair: (
+            bounds_area(pair[0]["bounds"]), -float(pair[0].get("last_used") or 0.0)))
+        plan.update({"ok": True, "reason": "VERIFY_PLANNED", "grid": checked["grid"],
+                     "store": entry, "entry_id": entry.get("id"),
+                     "store_sanity": checked["store_sanity"],
+                     "store_age_hours": (now - float(entry["saved_at"])) / 3600.0,
+                     "candidates": len(usable)})
         return plan
 
     def _start_verification(self, gcmd, candidate, request, plan, bed_target):
@@ -1082,9 +1399,11 @@ class OcteraMeshReuse:
         }
         x0, y0, x1, y1 = grid["bounds"]
         gcmd.respond_info(
-            "RUNNING MESH VERIFICATION %dx%d on stored %sx%s mesh (age %.1f h)" % (
-                grid["size"], grid["size"], plan["store"]["probe_count"][0],
-                plan["store"]["probe_count"][1], plan["store_age_hours"]))
+            "RUNNING MESH VERIFICATION %dx%d on stored mesh #%s %sx%s "
+            "(age %.1f h, %d candidate(s))" % (
+                grid["size"], grid["size"], plan.get("entry_id"),
+                plan["store"]["probe_count"][0], plan["store"]["probe_count"][1],
+                plan["store_age_hours"], plan.get("candidates", 1)))
         self.gcode.run_script_from_command("\n".join([
             "BED_MESH_CLEAR",
             "_BED_MESH_CALIBRATE MESH_MIN=%.3f,%.3f MESH_MAX=%.3f,%.3f "
@@ -1101,6 +1420,10 @@ class OcteraMeshReuse:
         }
         self.gcode.run_script_from_command("BED_MESH_PROFILE LOAD=%s" % name)
 
+    @staticmethod
+    def _plan_summary(plan):
+        return _plain({k: v for k, v in plan.items() if k != "store"})
+
     def cmd_OCTERA_MESH_VERIFY_FINISH(self, gcmd):
         pending = self.pending_verify
         self.pending_verify = None
@@ -1113,20 +1436,24 @@ class OcteraMeshReuse:
         result = verify_helpers.compare_verify(
             store["points"], plan["grid"], probed, self.verify_tolerance)
         result["duration_sec"] = eventtime - pending["started_at_monotonic"]
-        self.last_verify = {"timestamp": time.time(), "plan": _plain(
-            {k: v for k, v in plan.items() if k != "store"}), "result": _plain(result)}
+        self.last_verify = {"timestamp": time.time(), "plan": self._plan_summary(plan),
+                            "result": _plain(result)}
         logging.info("octera_mesh_reuse: verify %s", json.dumps(self.last_verify, sort_keys=True))
         gcmd.respond_info(
-            "OCTERA MESH VERIFY %s max_deviation=%s tolerance=%.3f" % (
-                result["reason"],
+            "OCTERA MESH VERIFY %s mesh #%s max_deviation=%s tolerance=%.3f" % (
+                result["reason"], plan.get("entry_id"),
                 "n/a" if result["max_deviation"] is None else "%.4f" % result["max_deviation"],
                 self.verify_tolerance))
         if not result["pass"]:
+            # The bed no longer matches this mesh: it is not offered again.
+            if store_forget(self._store(), plan.get("entry_id")):
+                self._save_store()
+                gcmd.respond_info("OCTERA MESH stored mesh #%s dropped" % plan.get("entry_id"))
             self._start_calibration(
                 gcmd, pending["candidate"], pending["request"], "adaptive",
                 result["reason"], pending["bed_target"], eventtime)
             return
-        self._install_profile(store["profile_name"], store["points"], store["mesh_params"])
+        self._install_profile(VERIFIED_PROFILE, store["points"], store["mesh_params"])
         eventtime = self.reactor.monotonic()
         heater = self.printer.lookup_object("heater_bed").get_status(eventtime)
         fingerprint, components = self._config_fingerprint(eventtime)
@@ -1147,18 +1474,33 @@ class OcteraMeshReuse:
             "fingerprint_components": components,
             "sanity": plan["store_sanity"],
             "kamp_version": SCHEMA,
+            "store_id": plan.get("entry_id"),
             "verify": result,
         }
         self.manual_invalidated = False
         self.last_invalidation_reason = "REUSE_PASS"
         self.validation_state = "VALID_FOR_REUSE"
-        gcmd.respond_info("REUSING VERIFIED STORED MESH %sx%s bounds=%s" % (
-            store["probe_count"][0], store["probe_count"][1], candidate["bounds"]))
+        entry = store_find(self._store(), plan.get("entry_id"))
+        if entry is not None:
+            entry["uses"] = int(entry.get("uses", 0) or 0) + 1
+            entry["last_used"] = time.time()
+        self._history_add({
+            "result": "REUSED_VERIFIED", "reason": result["reason"],
+            "origin": "adaptive", "bed_target": pending["bed_target"],
+            "required": pending["request"].get("required_bounds"),
+            "mesh_id": plan.get("entry_id"), "deviation": result["max_deviation"],
+            "probes": len(result.get("deviations") or []),
+            "count": store["probe_count"],
+        })
+        gcmd.respond_info("REUSING VERIFIED STORED MESH #%s %sx%s bounds=%s" % (
+            plan.get("entry_id"), store["probe_count"][0], store["probe_count"][1],
+            candidate["bounds"]))
 
     def cmd_OCTERA_MESH_INVALIDATE(self, gcmd):
         reason = gcmd.get("REASON", "REJECT_MANUAL_INVALIDATION").upper()
         if reason not in REASONS or reason == "REUSE_PASS":
             reason = "REJECT_MANUAL_INVALIDATION"
+        bed_temp = gcmd.get_float("BED_TEMP", None)
         self.manual_invalidated = True
         self.last_invalidation_reason = reason
         self.validation_state = "INVALIDATED"
@@ -1167,11 +1509,38 @@ class OcteraMeshReuse:
             self.metadata["thermal_valid"] = False
             self.metadata["invalidation_reason"] = reason
             self.metadata["invalidated_at"] = time.time()
-        self._drop_store(reason)
-        gcmd.respond_info("OCTERA_MESH_INVALIDATED reason=%s" % reason)
+        removed = self._drop_store(reason, bed_temp)
+        gcmd.respond_info("OCTERA_MESH_INVALIDATED reason=%s stored_meshes_dropped=%d%s" % (
+            reason, removed, "" if bed_temp is None else " bed_temp=%.0f" % bed_temp))
 
     def cmd_OCTERA_MESH_REUSE_STATUS(self, gcmd):
         gcmd.respond_info(json.dumps(self.get_status(self.reactor.monotonic()), sort_keys=True))
+
+    def cmd_OCTERA_MESH_HISTORY(self, gcmd):
+        store = self._store()
+        lines = ["OCTERA MESH STORE: %d mesh(es), check %s, tolerance %.3f mm, "
+                 "up to %d per temperature" % (
+                     len(store["entries"]),
+                     "on" if self.verify_enabled else "off",
+                     self.verify_tolerance, getattr(self, "max_meshes", 6))]
+        for item in store_summary(store):
+            lines.append("#%s %sC %sx%s area %.0f,%.0f-%.0f,%.0f used %s saved %s" % (
+                item["id"], temperature_key(item["bed_target"]),
+                item["probe_count"][0], item["probe_count"][1],
+                item["bounds"][0], item["bounds"][1], item["bounds"][2], item["bounds"][3],
+                item["uses"],
+                time.strftime("%m-%d %H:%M", time.localtime(float(item["saved_at"])))))
+        for item in store["history"][-10:]:
+            lines.append("%s %s %s%s%s%s" % (
+                time.strftime("%m-%d %H:%M", time.localtime(float(item.get("time", 0)))),
+                "" if item.get("bed_target") is None
+                else "%sC" % temperature_key(item["bed_target"]),
+                item.get("result"),
+                "" if item.get("mesh_id") is None else " #%s" % item["mesh_id"],
+                "" if item.get("deviation") is None
+                else " worst %.3f mm" % float(item["deviation"]),
+                "" if not item.get("reason") else " (%s)" % item["reason"]))
+        gcmd.respond_info("\n".join(lines))
 
     def get_status(self, eventtime):
         fingerprint = None
@@ -1179,6 +1548,12 @@ class OcteraMeshReuse:
             fingerprint, _ = self._config_fingerprint(eventtime)
         except Exception:
             logging.exception("octera_mesh_reuse: status fingerprint failed")
+        try:
+            store = self._store()
+            stored, history = store_summary(store), store["history"][-STATUS_HISTORY:]
+        except Exception:
+            logging.exception("octera_mesh_reuse: status store failed")
+            stored, history = [], []
         return {
             "schema": SCHEMA,
             "module_sha256": MODULE_SHA256,
@@ -1195,6 +1570,15 @@ class OcteraMeshReuse:
             "last_verify": _plain(self.last_verify),
             "current_config_fingerprint": fingerprint,
             "policy": _plain(self._policy()),
+            "store_schema": STORE_SCHEMA,
+            "store_policy": {
+                "verify_tolerance": self.verify_tolerance,
+                "verify_min_full_count": self.verify_min_full_count,
+                "verify_max_age_hours": self.verify_max_age_hours,
+                "max_meshes_per_temperature": getattr(self, "max_meshes", 6),
+            },
+            "stored_meshes": _plain(stored),
+            "history": _plain(history),
         }
 
 

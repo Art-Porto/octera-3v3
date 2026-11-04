@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Verified reuse (V2): store, plan, verification probe and outcome."""
+"""Verified reuse (V2): store, plan, verification probe and outcome.
+
+The store is written in the v1 format, so this also covers its migration."""
 
 from __future__ import annotations
 
@@ -112,7 +114,7 @@ def make_owner(store_path, verify_probe=None):
 
 def write_store(path, **overrides):
     store = {
-        "schema": MODULE.STORE_SCHEMA, "saved_at": time.time(),
+        "schema": MODULE.STORE_SCHEMA_V1, "saved_at": time.time(),
         "profile_name": "adaptive", "bounds": STORE_BOUNDS,
         "probe_count": [7, 7], "spacing": [18.67, 18.67], "points": STORED,
         "mesh_params": {"x_count": 7, "y_count": 7, "min_x": 94.0, "max_x": 206.0,
@@ -182,11 +184,15 @@ def run() -> dict:
     if any("octera_verify" in s for s in o.scripts):
         failures.append("verification ran while disabled")
 
-    # Invalidation drops the store.
+    # Invalidation drops the stored meshes and keeps the history.
+    write_store(path)
     o, _ = make_owner(path)
     o._drop_store("test")
     checks += 1
-    if os.path.exists(path):
+    o2, _ = make_owner(path)
+    if (o2._store()["entries"]
+            or o2._verify_plan(o2._request(0, 55.0), 55.0)["reason"] != "VERIFY_NO_STORE"
+            or o2._store()["history"][-1]["result"] != "INVALIDATED"):
         failures.append("store survived invalidation")
     return {"pass": not failures, "checks": checks, "failures": failures}
 

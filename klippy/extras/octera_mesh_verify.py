@@ -4,8 +4,8 @@ A stored mesh is checked by probing a small square grid (3x3 by default) whose p
 nodes of the stored grid, then comparing node by node. No interpolation is
 involved, so the check does not depend on the mesh algorithm.
 
-Not wired into Klipper yet; see docs/design/MESH_REUSE_V2.md in the
-engineering repository.
+Used by octera_mesh_reuse; see docs/design/MESH_REUSE_V2.md and
+MESH_REUSE_V3.md in the engineering repository.
 """
 
 from __future__ import annotations
