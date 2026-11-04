@@ -35,6 +35,7 @@
     {"id": 32, "name": "second_identical_print", "mutation": "second_identical", "expected": "REUSE_PASS"},
     {"id": 33, "name": "third_smaller_contained", "mutation": "third_smaller", "expected": "REUSE_PASS"},
     {"id": 34, "name": "third_partially_outside", "mutation": "third_outside", "expected": "REJECT_COVERAGE"},
-    {"id": 35, "name": "bed_mesh_clear_only_on_calibrate", "mutation": "dispatch_contract", "expected": "REUSE_PASS"}
+    {"id": 35, "name": "bed_mesh_clear_only_on_calibrate", "mutation": "dispatch_contract", "expected": "REUSE_PASS"},
+    {"id": 36, "name": "reprint_on_klipper_rounded_mesh", "mutation": "klipper_rounded_max", "expected": "REUSE_PASS"}
   ]
 }

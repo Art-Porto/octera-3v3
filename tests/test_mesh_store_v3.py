@@ -74,6 +74,9 @@ class Bed:
 
     def probe(self, bounds, count, name):
         x0, y0, x1, y1 = bounds
+        # Like bed_mesh: the spacing is floored to 0.01 mm, mesh_max moves in.
+        x1 = x0 + math.floor((x1 - x0) / (count - 1) * 100) / 100 * (count - 1)
+        y1 = y0 + math.floor((y1 - y0) / (count - 1) * 100) / 100 * (count - 1)
         matrix = [[self.surface(x0 + (x1 - x0) * i / (count - 1),
                                 y0 + (y1 - y0) * j / (count - 1))
                    for i in range(count)] for j in range(count)]
@@ -442,6 +445,39 @@ def run():
     result = MODULE.store_add_entry(store, other, 6, 3.0)
     check("covering at another temperature does not replace",
           result["replaced"] == [] and len(store["entries"]) == 2, store["entries"])
+
+    # 17. bed_mesh floors the spacing, so mesh_max falls short of the part
+    # (2026-11-04: the same part reprinted never matched its own 8x8).
+    real = [41.3995, 67.7995, 258.6, 232.2]   # 8x8, spacing floored to 31.02 / 23.48
+    path = fresh_path()
+    p = Printer(path)
+    p.start_print(real)
+    check("rounded mesh ends short of the part",
+          abs(p.bed.bounds[2] - p.bed.bounds[0] - 7 * 31.02) < 1e-6
+          and abs(p.bed.bounds[3] - p.bed.bounds[1] - 7 * 23.48) < 1e-6,
+          p.bed.bounds)
+    p.start_print(real)
+    check("same part, same session: reused despite the rounding",
+          p.last()["result"] == "REUSED_SESSION" and len(p.bed.calibrations) == 1,
+          p.history())
+    p = Printer(path, bed=p.bed)
+    p.start_print(real)
+    check("8x8 after restart: no 3x3 fits its 7 intervals, probes",
+          p.last()["result"] == "PROBED" and p.last().get("verify_skipped") == "VERIFY_NO_GRID",
+          p.history())
+    wide = [20.0, 20.0, 270.079, 270.079]     # 9x9, spacing 31.2599 -> 31.25
+    path = fresh_path()
+    p = Printer(path)
+    p.start_print(wide)
+    p = Printer(path, bed=p.bed)
+    p.start_print(wide)
+    check("9x9 0.079 short after restart: checked and reused",
+          p.last()["result"] == "REUSED_VERIFIED" and len(p.bed.calibrations) == 1,
+          p.history())
+    beyond = [20.0, 20.0, 270.2, 270.2]       # 0.2 past the stored mesh
+    p.start_print(beyond)
+    check("part 0.2 mm past the mesh still probes",
+          p.last()["result"] == "PROBED", p.history())
 
     failures = [r for r in RESULTS if not r["pass"]]
     return {"pass": not failures, "checks": len(RESULTS), "failures": failures}

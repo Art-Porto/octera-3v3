@@ -13,6 +13,16 @@ from __future__ import annotations
 import math
 
 
+def rounding_allowance(count):
+    """How far bed_mesh may pull mesh_max in from the requested maximum.
+
+    Klipper floors the probe spacing to 0.01 mm, so the last node lands up to
+    0.01 mm short per interval: an 8x8 over 217.2 mm ends at 258.54, not
+    258.60. Only the high side moves; mesh_min is kept as requested.
+    """
+    return 0.01 * max(int(count) - 1, 0)
+
+
 def node_coordinate(low, high, count, index):
     return low + (high - low) * index / (count - 1)
 
@@ -52,7 +62,8 @@ def select_verify_grid(stored_bounds, stored_count, required_bounds,
             low, high = float(stored_bounds[axis]), float(stored_bounds[axis + 2])
             need_low = float(required_bounds[axis])
             need_high = float(required_bounds[axis + 2])
-            if need_low < low - epsilon or need_high > high + epsilon:
+            if (need_low < low - epsilon
+                    or need_high > high + max(epsilon, rounding_allowance(cols))):
                 return None
             nodes = _axis_nodes(low, high, cols, need_low + epsilon,
                                 need_high - epsilon, (size,))

@@ -396,12 +396,7 @@ def evaluate_reuse(candidate, metadata, request, policy):
         decision["reason"] = "REJECT_MESH_CHANGED"
         return decision
     required = [float(value) for value in request["required_bounds"]]
-    coverage = (
-        loaded[0] <= required[0] + COVERAGE_EPSILON_MM
-        and loaded[1] <= required[1] + COVERAGE_EPSILON_MM
-        and loaded[2] >= required[2] - COVERAGE_EPSILON_MM
-        and loaded[3] >= required[3] - COVERAGE_EPSILON_MM
-    )
+    coverage = bounds_cover(loaded, required, count=sanity["count"])
     decision["gates"]["coverage"] = coverage
     if not coverage:
         decision["reason"] = "REJECT_COVERAGE"
@@ -450,11 +445,24 @@ def temperature_key(bed_target):
     return str(int(round(float(bed_target))))
 
 
-def bounds_cover(outer, inner, epsilon=COVERAGE_EPSILON_MM):
+def bounds_cover(outer, inner, epsilon=COVERAGE_EPSILON_MM, count=None):
+    """Whether the mesh area outer covers inner.
+
+    With count (the outer mesh's probe count), the high side also accepts
+    the shortfall bed_mesh leaves when it floors the probe spacing; without
+    it, a part reprinted on its own mesh never matched (2026-11-04: 8x8 to
+    258.54 against 258.60 required).
+    """
+    slack_x = slack_y = epsilon
+    if count is not None:
+        # The floor loses less than 0.01 mm per interval: the larger of the
+        # two slacks is enough, never their sum.
+        slack_x = max(epsilon, verify_helpers.rounding_allowance(count[0]))
+        slack_y = max(epsilon, verify_helpers.rounding_allowance(count[1]))
     return (float(outer[0]) <= float(inner[0]) + epsilon
             and float(outer[1]) <= float(inner[1]) + epsilon
-            and float(outer[2]) >= float(inner[2]) - epsilon
-            and float(outer[3]) >= float(inner[3]) - epsilon)
+            and float(outer[2]) >= float(inner[2]) - slack_x
+            and float(outer[3]) >= float(inner[3]) - slack_y)
 
 
 def bounds_area(bounds):
@@ -544,7 +552,8 @@ def store_add_entry(store, entry, max_per_temperature, bed_temp_tolerance):
         if other.get("config_fingerprint") != fingerprint:
             evicted.append(other.get("id"))
         elif (abs(float(other["bed_target"]) - target) <= float(bed_temp_tolerance)
-              and bounds_cover(entry["bounds"], other["bounds"])):
+              and bounds_cover(entry["bounds"], other["bounds"],
+                               count=entry.get("probe_count"))):
             replaced.append(other.get("id"))
         else:
             kept.append(other)

@@ -91,11 +91,19 @@ def mutate(name: str, candidate: dict, metadata: dict | None,
     elif name == "outside_x_min":
         request["required_bounds"][0] = candidate["bounds"][0] - 0.051
     elif name == "outside_x_max":
-        request["required_bounds"][2] = candidate["bounds"][2] + 0.051
+        # The high side also allows the 0.01 mm per interval bed_mesh loses.
+        cols = len(candidate["probed_matrix"][0])
+        request["required_bounds"][2] = candidate["bounds"][2] + max(0.051, 0.01 * (cols - 1) + 0.001)
     elif name == "outside_y_min":
         request["required_bounds"][1] = candidate["bounds"][1] - 0.051
     elif name == "outside_y_max":
-        request["required_bounds"][3] = candidate["bounds"][3] + 0.051
+        rows = len(candidate["probed_matrix"])
+        request["required_bounds"][3] = candidate["bounds"][3] + max(0.051, 0.01 * (rows - 1) + 0.001)
+    elif name == "klipper_rounded_max":
+        # 2026-11-04, the same part reprinted: bed_mesh floored the 8x8
+        # spacing to 31.02/23.48, so mesh_max fell 0.06/0.04 short.
+        set_mesh(candidate, metadata, 8, [41.4, 67.8, 258.54, 232.16])
+        request["required_bounds"] = [41.3995, 67.7995, 258.6, 232.2]
     elif name == "large_mesh":
         set_mesh(candidate, metadata, 9, [15.0, 15.0, 285.0, 285.0])
     elif name == "density_bad":
@@ -152,11 +160,15 @@ def k2_coverage(candidate: dict, required: list[float], enabled: bool = True) ->
     if not enabled or not candidate.get("probed_matrix"):
         return False
     bounds = candidate["bounds"]
+    rows = candidate["probed_matrix"]
+    eps = MODULE.COVERAGE_EPSILON_MM
+    slack_x = max(eps, 0.01 * (len(rows[0]) - 1))  # bed_mesh floors the spacing
+    slack_y = max(eps, 0.01 * (len(rows) - 1))
     return (
-        bounds[0] <= required[0] + MODULE.COVERAGE_EPSILON_MM
-        and bounds[1] <= required[1] + MODULE.COVERAGE_EPSILON_MM
-        and bounds[2] >= required[2] - MODULE.COVERAGE_EPSILON_MM
-        and bounds[3] >= required[3] - MODULE.COVERAGE_EPSILON_MM
+        bounds[0] <= required[0] + eps
+        and bounds[1] <= required[1] + eps
+        and bounds[2] >= required[2] - slack_x
+        and bounds[3] >= required[3] - slack_y
     )
 
 
