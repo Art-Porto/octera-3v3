@@ -18,6 +18,10 @@
 # Prints PASS/FAIL per check; exit code 1 if any check fails.
 
 SHIM="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
+# Refuse a shim that would act on the real services (2026-11-05: the old
+# shim ignored SHIM_INIT_DIR and the fake Moonraker restarted the real one).
+grep -q "SHIM_INIT_DIR" "$SHIM" && grep -q "SHIM_RUN_DIR" "$SHIM" || {
+  echo "refusing: $SHIM does not honour SHIM_INIT_DIR/SHIM_RUN_DIR"; exit 2; }
 T="$(mktemp -d /tmp/shimtest.XXXXXX)"
 mkdir -p "$T/init" "$T/run" "$T/bin"
 cp /bin/busybox "$T/bin/sh"            # own exe path, like moonraker's python
