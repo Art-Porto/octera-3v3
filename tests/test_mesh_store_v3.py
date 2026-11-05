@@ -138,6 +138,7 @@ class Printer:
         o.mesh_time_base, o.mesh_time_per_point = 55.0, 4.5
         o.bed_temp_tolerance, o.density_epsilon = 3.0, 0.05
         o.sanity_max_abs, o.sanity_max_range, o.sanity_max_neighbor_jump = 1.0, 0.8, 0.5
+        o.sanity_max_slope, o.sanity_max_zigzag = 0.90, 2
         o.sanity_probe_duration_factor, o.sanity_probe_duration_slack = 2.0, 120.0
         o.verify_enabled, o.verify_tolerance = True, verify_tolerance
         o.verify_min_full_count, o.verify_max_age_hours = 5, 0.0
@@ -569,6 +570,48 @@ def run():
     check("status shows the offset and its limit",
           status["last_verify"]["result"]["offset"] == item["offset"]
           and status["store_policy"]["verify_max_offset"] == 0.5, status["store_policy"])
+
+    # 21. A stored mesh that zig-zags along its first row is never checked:
+    # the part is probed and stored. The refused entry stays on disk (as for
+    # any stored-sanity refusal) and is refused again on every use.
+    path = fresh_path()
+    p = Printer(path)
+    p.start_print(A)
+    entry = p.o._store()["entries"][0]
+    entry["points"][0] = [v + (0.1 if i % 2 else -0.1)
+                          for i, v in enumerate(entry["points"][0])]
+    p.o._save_store()
+    bed = p.bed
+    p = Printer(path, bed=bed)
+    p.start_print(PART_A)
+    item = p.last()
+    plan = p.o.last_verify
+    check("stored zig-zag: not checked, part probed and stored",
+          item["result"] == "PROBED" and len(bed.checks) == 0
+          and len(bed.calibrations) == 2 and p.ids() == [1, 2]
+          and item.get("verify_skipped") == "VERIFY_STORE_SANITY"
+          and plan["plan"]["refusals"] == {"VERIFY_STORE_SANITY": 1},
+          {"item": item, "plan": plan})
+
+    # 22. A freshly probed mesh that zig-zags is rejected before it is stored.
+    path = fresh_path()
+    bed = Bed()
+    bed.surface = lambda x, y: flat_bed(x, y) + 0.1 * math.cos(math.pi * (x - 20.0) / 30.0)
+    p = Printer(path, bed=bed)
+    raised = None
+    try:
+        p.start_print(A)
+    except Exception as exc:  # the print is aborted, as for any sanity failure
+        raised = exc
+    status = p.o.get_status(0)
+    check("fresh zig-zag: rejected, cleared, nothing stored",
+          p.o._store()["entries"] == [] and p.o.metadata is None
+          and "SANITY_ZIGZAG" in ((p.o.last_rejection or {}).get("sanity", {})
+                                  .get("failure_codes") or []),
+          {"raised": repr(raised), "rejection": p.o.last_rejection})
+    check("status shows the new limits",
+          status["store_policy"]["sanity_max_slope"] == 0.9
+          and status["store_policy"]["sanity_max_zigzag"] == 2, status["store_policy"])
 
     failures = [r for r in RESULTS if not r["pass"]]
     return {"pass": not failures, "checks": len(RESULTS), "failures": failures}

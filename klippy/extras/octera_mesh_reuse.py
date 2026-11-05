@@ -8,8 +8,13 @@ mesh without probing.
 V2/V3: every accepted mesh is also kept on disk, grouped by bed temperature,
 several areas per temperature and with no age limit.  When V1 refuses, the
 smallest stored mesh that covers the part is checked against the real bed
-with a 3x3 on its own nodes and reused only if every node agrees.  Each
+with a 3x3 over the part and reused only if its shape agrees.  Each
 decision is kept in a short history that survives restarts.
+
+Sanity also rejects a mesh whose slope between neighbouring nodes is too
+steep for the bed (mm per 100 mm, independent of the spacing) or that
+zig-zags along a row or column (signs of consecutive steps alternating),
+the pattern of a badly probed edge.
 
 The decision engine is intentionally independent from Klipper so the exact
 live policy can be exercised with offline fixtures.
@@ -210,7 +215,30 @@ def square_probe_plan(required_kamp_bounds, bed_min, bed_max, probe_count,
     }
 
 
+ZIGZAG_MIN_STEP_MM = 0.05
+
+
+def zigzag_run(line, min_step=ZIGZAG_MIN_STEP_MM):
+    """Longest run of consecutive sign changes between steps of a line.
+
+    Only steps of at least min_step count on both sides of a change, so the
+    probe noise on a flat bed is not a zig-zag.
+    """
+    steps = [float(line[k + 1]) - float(line[k]) for k in range(len(line) - 1)]
+    run = best = 0
+    for k in range(1, len(steps)):
+        if (steps[k] * steps[k - 1] < 0.0
+                and min(abs(steps[k]), abs(steps[k - 1])) >= float(min_step)):
+            run += 1
+            best = max(best, run)
+        else:
+            run = 0
+    return best
+
+
 def mesh_sanity(mesh, *, max_abs, max_range, max_neighbor_jump,
+                max_slope=None, max_zigzag=None,
+                zigzag_min_step=ZIGZAG_MIN_STEP_MM,
                 expected_count=None, probe_duration_sec=None,
                 expected_duration_sec=None, duration_factor=2.0,
                 duration_slack=120.0, known_algorithms=KNOWN_ALGORITHMS):
@@ -230,6 +258,8 @@ def mesh_sanity(mesh, *, max_abs, max_range, max_neighbor_jump,
         "mean": None,
         "range": None,
         "max_neighbor_jump": None,
+        "max_slope": None,
+        "zigzag": None,
         "algorithm": algorithm,
         "probe_duration_sec": probe_duration_sec,
         "expected_duration_sec": expected_duration_sec,
@@ -283,17 +313,24 @@ def mesh_sanity(mesh, *, max_abs, max_range, max_neighbor_jump,
     minimum = min(values)
     maximum = max(values)
     span = maximum - minimum
+    spacing_x = (numeric_bounds[2] - numeric_bounds[0]) / (cols - 1)
+    spacing_y = (numeric_bounds[3] - numeric_bounds[1]) / (rows - 1)
     jumps = []
+    slopes = []
     for y, row in enumerate(matrix):
         for x, raw in enumerate(row):
             value = float(raw)
             if x + 1 < cols:
                 jumps.append(abs(value - float(row[x + 1])))
+                slopes.append(jumps[-1] / spacing_x)
             if y + 1 < rows:
                 jumps.append(abs(value - float(matrix[y + 1][x])))
+                slopes.append(jumps[-1] / spacing_y)
     neighbor = max(jumps) if jumps else 0.0
-    spacing_x = (numeric_bounds[2] - numeric_bounds[0]) / (cols - 1)
-    spacing_y = (numeric_bounds[3] - numeric_bounds[1]) / (rows - 1)
+    slope = 100.0 * max(slopes) if slopes else 0.0
+    lines = [list(row) for row in matrix]
+    lines += [[matrix[y][x] for y in range(rows)] for x in range(cols)]
+    zigzag = max(zigzag_run(line, zigzag_min_step) for line in lines)
     result.update({
         "count": [cols, rows],
         "spacing": [spacing_x, spacing_y],
@@ -302,6 +339,8 @@ def mesh_sanity(mesh, *, max_abs, max_range, max_neighbor_jump,
         "mean": sum(values) / len(values),
         "range": span,
         "max_neighbor_jump": neighbor,
+        "max_slope": slope,
+        "zigzag": zigzag,
     })
     if maximum > float(max_abs) or minimum < -float(max_abs):
         reject("SANITY_ABS_EXCEEDED")
@@ -309,6 +348,10 @@ def mesh_sanity(mesh, *, max_abs, max_range, max_neighbor_jump,
         reject("SANITY_RANGE_EXCEEDED")
     if neighbor > float(max_neighbor_jump):
         reject("SANITY_NEIGHBOR_JUMP_EXCEEDED")
+    if max_slope is not None and slope > float(max_slope):
+        reject("SANITY_SLOPE_EXCEEDED")
+    if max_zigzag is not None and zigzag > int(max_zigzag):
+        reject("SANITY_ZIGZAG")
     if probe_duration_sec is not None or expected_duration_sec is not None:
         try:
             actual_duration = float(probe_duration_sec)
@@ -359,6 +402,8 @@ def evaluate_reuse(candidate, metadata, request, policy):
         max_abs=policy["sanity_max_abs"],
         max_range=policy["sanity_max_range"],
         max_neighbor_jump=policy["sanity_max_neighbor_jump"],
+        max_slope=policy.get("sanity_max_slope"),
+        max_zigzag=policy.get("sanity_max_zigzag"),
     )
     decision["sanity"] = sanity
     decision["gates"]["sanity"] = sanity["pass"]
@@ -621,6 +666,13 @@ class OcteraMeshReuse:
         self.sanity_max_neighbor_jump = config.getfloat(
             "sanity_max_neighbor_jump", 0.50, minval=0.01
         )
+        # Not in the config fingerprint (changing them keeps the stored
+        # meshes): steepest slope between neighbours, mm per 100 mm, and the
+        # longest allowed run of sign changes along a row or column.
+        self.sanity_max_slope = config.getfloat(
+            "sanity_max_slope", 0.90, minval=0.05, maxval=10.0)
+        self.sanity_max_zigzag = config.getint(
+            "sanity_max_zigzag", 2, minval=1, maxval=20)
         self.sanity_probe_duration_factor = config.getfloat(
             "sanity_probe_duration_factor", 2.0, minval=1.0
         )
@@ -754,6 +806,8 @@ class OcteraMeshReuse:
             "sanity_max_abs": self.sanity_max_abs,
             "sanity_max_range": self.sanity_max_range,
             "sanity_max_neighbor_jump": self.sanity_max_neighbor_jump,
+            "sanity_max_slope": getattr(self, "sanity_max_slope", None),
+            "sanity_max_zigzag": getattr(self, "sanity_max_zigzag", None),
             "sanity_probe_duration_factor": self.sanity_probe_duration_factor,
             "sanity_probe_duration_slack": self.sanity_probe_duration_slack,
         }
@@ -1156,6 +1210,8 @@ class OcteraMeshReuse:
             max_abs=self.sanity_max_abs,
             max_range=self.sanity_max_range,
             max_neighbor_jump=self.sanity_max_neighbor_jump,
+            max_slope=getattr(self, "sanity_max_slope", None),
+            max_zigzag=getattr(self, "sanity_max_zigzag", None),
             expected_count=request.get("required_probe_count"),
             probe_duration_sec=duration,
             expected_duration_sec=request.get("estimated_probe_seconds"),
@@ -1352,6 +1408,8 @@ class OcteraMeshReuse:
         sanity = mesh_sanity(
             mesh, max_abs=self.sanity_max_abs, max_range=self.sanity_max_range,
             max_neighbor_jump=self.sanity_max_neighbor_jump,
+            max_slope=getattr(self, "sanity_max_slope", None),
+            max_zigzag=getattr(self, "sanity_max_zigzag", None),
             expected_count=entry.get("probe_count"),
         )
         if not sanity["pass"]:
@@ -1605,6 +1663,8 @@ class OcteraMeshReuse:
             "store_schema": STORE_SCHEMA,
             "store_policy": {
                 "verify_tolerance": self.verify_tolerance,
+                "sanity_max_slope": getattr(self, "sanity_max_slope", None),
+                "sanity_max_zigzag": getattr(self, "sanity_max_zigzag", None),
                 "verify_max_offset": getattr(self, "verify_max_offset",
                                              verify_helpers.VERIFY_MAX_OFFSET_MM),
                 "verify_min_full_count": self.verify_min_full_count,
