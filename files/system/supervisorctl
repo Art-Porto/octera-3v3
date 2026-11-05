@@ -4,6 +4,22 @@
 # good enough to list the names of services in moonraker.conf, to say whether they're running or not (with false pids and times)
 # and to start and stop them by name, finding and calling the matching init scripts. 
 # installing: put this in in /usr/bin/supervisorctl and then in moonraker.conf in [machine] section, set  "provider: supervisord_cli"
+#
+# Octera changes (2026-11-05):
+# - stop/restart take down the whole process tree of the service. The plugin
+#   init scripts start a sh wrapper that runs python as a child, and
+#   start-stop-daemon -K only kills the wrapper; the old python stayed alive
+#   next to the new one (OctoEverywhere PID 1444).
+# - restart waits for the old tree to be gone before starting.
+# - "restart moonraker" runs detached. Moonraker runs this shim as its own
+#   child and cancels its running commands while it shuts down, so the start
+#   half never ran and Moonraker stayed down after an update (15:01:25).
+#
+# SHIM_INIT_DIR / SHIM_RUN_DIR / SHIM_PROC override the system paths (tests).
+
+INIT_DIR="${SHIM_INIT_DIR:-/etc/init.d}"
+RUN_DIR="${SHIM_RUN_DIR:-/var/run}"
+PROC="${SHIM_PROC:-/proc}"
 
 if [ -t 1 ]; then  # colorize only if we're on a terminal
   GREEN='\033[32m'
@@ -12,18 +28,18 @@ if [ -t 1 ]; then  # colorize only if we're on a terminal
 fi
 
 get_services() {
-  moonraker_pid="$(cat /var/run/moonraker.pid)"
+  moonraker_pid="$(cat "$RUN_DIR"/moonraker.pid 2>/dev/null)"
   # if moonraker is running, get its config directory from its command line
-  if [ -f /var/run/moonraker.pid ] && [ -d /proc/"$moonraker_pid" ] ; then
+  if [ -f "$RUN_DIR"/moonraker.pid ] && [ -d "$PROC"/"$moonraker_pid" ] ; then
     cmdline="$(tr '\0' '\n' < /proc/"$moonraker_pid"/cmdline)"
     moonraker_dir="$(echo $cmdline | awk -F'-d ' '{print $2}' | awk '{print $1}')"
     moonraker_conf="$moonraker_dir/config/moonraker.conf"
     # services="klipper moonraker $(awk '/managed_services:/ {print $2}' $moonraker_conf | sed 's/://')"
     # services=`(printf 'klipper\nmoonraker\n'; awk '/managed_services:/ {print $2}' $moonraker_conf | sed 's/://') | sort|uniq`
-    services=$(ls -1 /etc/init.d/S*|sed 's/.*\/S..//;s/_service$//')
+    services=$(ls -1 "$INIT_DIR"/S*|sed 's/.*\/S..//;s/_service$//')
     echo $services
   else
-    echo "Error: Invalid or missing PID file /var/run/moonraker.pid" >&2
+    echo "Error: Invalid or missing PID file $RUN_DIR/moonraker.pid" >&2
     exit 1
   fi
 }
@@ -31,7 +47,7 @@ get_services() {
 get_pid_file() {
   service="$1"
   [ $service == "klipper" ] && service="klippy"
-  pid_file="/var/run/$service.pid"
+  pid_file="$RUN_DIR/$service.pid"
   echo $pid_file
 }
 
@@ -40,7 +56,7 @@ is_running() {
   pid_file="$(get_pid_file "$service")"
 
   # Check for PID file
-  if [ -f "$pid_file" ] && [ -d "/proc/$(cat $pid_file)" ]; then
+  if [ -f "$pid_file" ] && [ -d "$PROC/$(cat $pid_file)" ]; then
       return 0  # Running
   fi
 
@@ -67,16 +83,61 @@ print_usage() {
 
 get_script_path() {
   service="$1"
-  script_path="$(ls -1 /etc/init.d/S[0-9][0-9]${service}_service /etc/init.d/S[0-9][0-9]${service}* 2>/dev/null|head -1)"
+  script_path="$(ls -1 "$INIT_DIR"/S[0-9][0-9]${service}_service "$INIT_DIR"/S[0-9][0-9]${service}* 2>/dev/null|head -1)"
   echo "$script_path"
+}
+
+children_of() { # children_of <pid>: pids whose parent is <pid>
+  for stat in "$PROC"/[0-9]*/stat; do
+    line="$(cat "$stat" 2>/dev/null)" || continue
+    rest="${line##*) }"            # drop "pid (comm) ", comm may hold spaces
+    ppid="$(echo "$rest" | cut -d' ' -f2)"
+    if [ "$ppid" = "$1" ]; then
+      child="${stat%/stat}"
+      echo "${child##*/}"
+    fi
+  done
+}
+
+tree_of() { # tree_of <pid>: <pid> and all its descendants, never this shim
+  [ "$1" = "$$" ] && return 0
+  echo "$1"
+  for child in $(children_of "$1"); do
+    tree_of "$child"
+  done
+}
+
+service_tree() { # service_tree <service>: the running tree of its pid file
+  pid_file="$(get_pid_file "$1")"
+  [ -f "$pid_file" ] || return 0
+  pid="$(cat "$pid_file" 2>/dev/null)"
+  [ -n "$pid" ] && [ -d "$PROC/$pid" ] && tree_of "$pid"
+  return 0
+}
+
+reap() { # reap <pid...>: TERM what is still alive, wait up to 5 s, then KILL
+  alive=""
+  for p in "$@"; do [ -d "$PROC/$p" ] && alive="$alive $p"; done
+  [ -n "$alive" ] || return 0
+  kill $alive 2>/dev/null
+  for i in $(seq 50); do
+    left=""
+    for p in $alive; do [ -d "$PROC/$p" ] && left="$left $p"; done
+    [ -n "$left" ] || return 0
+    usleep 100000
+  done
+  kill -9 $left 2>/dev/null
+  return 0
 }
 
 stop() {
   service="$1"
   script_path="$(get_script_path $service)"
-  # Check if the script exists and stop the service
+  # Check if the script exists and stop the service with all its children
   if [[ -f "$script_path" ]]; then
+    tree="$(service_tree "$service")"
     "$script_path" stop
+    reap $tree
   fi
 }
 
@@ -92,10 +153,16 @@ start() {
 restart() {
   service="$1"
   script_path="$(get_script_path $service)"
-  # Check if the script exists and restart the service
-  if [[ -f "$script_path" ]]; then
-    "$script_path" restart
+  [[ -f "$script_path" ]] || return 0
+  if [ "$service" = "moonraker" ] && [ -z "$SHIM_DETACHED" ]; then
+    # Moonraker runs this as its child and kills it while shutting down:
+    # leave its process tree and let the caller return at once.
+    ( SHIM_DETACHED=1 setsid "$0" restart moonraker </dev/null >/dev/null 2>&1 & )
+    return 0
   fi
+  [ -n "$SHIM_DETACHED" ] && usleep 500000   # let the caller see us return
+  stop "$service"
+  start "$service"
 }
 
 main() {
