@@ -11,7 +11,10 @@
 #     program, and stop none;
 #  2. "restart moonraker" issued by Moonraker itself, which on SIGTERM
 #     cancels the running shim (SIGINT, wait up to 2 s) and lingers before
-#     exiting: a new instance must come up.
+#     exiting: a new instance must come up, twice in a row (v1.2.2 leaked
+#     its detach flag into the new Moonraker, so the second self-restart
+#     ran inline and Moonraker stayed down), with the caller's PATH reduced
+#     to /bin.
 # Prints PASS/FAIL per check; exit code 1 if any check fails.
 
 SHIM="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
@@ -83,7 +86,7 @@ M
 cat > "$T/init/S56moonraker_service" <<I
 #!/bin/sh
 PID_FILE=$T/run/moonraker.pid
-start() { start-stop-daemon -S -q -b -m -p \$PID_FILE --exec $T/bin/sh -- $T/moon.sh; }
+start() { /usr/bin/env -i PATH=/bin SHIM_INIT_DIR=$T/init SHIM_RUN_DIR=$T/run SHIM_DETACH_LOG=$T/detach.log /sbin/start-stop-daemon -S -q -b -m -p \$PID_FILE --exec $T/bin/sh -- $T/moon.sh; }
 stop() { start-stop-daemon -K -q -p \$PID_FILE; }
 case "\$1" in
   start) start ;;
@@ -95,13 +98,17 @@ chmod +x "$T/init/S56moonraker_service"
 
 "$T/init/S56moonraker_service" start
 wait_for '[ -s "$T/moon_starts" ]' 30
-first="$(cat "$T/run/moonraker.pid")"
-touch "$T/trigger"
-wait_for '[ "$(wc -l < $T/moon_starts)" -ge 2 ] && alive "$(cat $T/run/moonraker.pid)"' 150
-now="$(cat "$T/run/moonraker.pid")"
-check "moonraker self-restart: old instance gone" $(! alive "$first"; echo $?)
-check "moonraker self-restart: new instance up" $([ "$now" != "$first" ] && alive "$now"; echo $?) \
-  "(starts: $(wc -l < "$T/moon_starts"))"
+for round in 1 2; do
+  first="$(cat "$T/run/moonraker.pid")"
+  touch "$T/trigger"
+  wait_for '[ "$(wc -l < $T/moon_starts)" -ge $((round + 1)) ] && alive "$(cat $T/run/moonraker.pid)" && [ "$(cat $T/run/moonraker.pid)" != "$first" ]' 150
+  now="$(cat "$T/run/moonraker.pid")"
+  check "moonraker self-restart $round: old instance gone" $(! alive "$first"; echo $?)
+  check "moonraker self-restart $round: new instance up" $([ "$now" != "$first" ] && alive "$now"; echo $?) \
+    "(starts: $(wc -l < "$T/moon_starts"); log: $(tr '\n' ' ' < "$T/detach.log" 2>/dev/null))"
+  check "moonraker self-restart $round: no shim flag in its environment" \
+    $(! { tr '\0' '\n' < "/proc/$now/environ"; } 2>/dev/null | grep -q "DETACHED"; echo $?)
+done
 
 # --- cleanup ---------------------------------------------------------------
 for pf in "$T"/run/*.pid; do

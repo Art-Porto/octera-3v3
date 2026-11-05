@@ -15,7 +15,20 @@
 #   child and cancels its running commands while it shuts down, so the start
 #   half never ran and Moonraker stayed down after an update (15:01:25).
 #
+#   The detached run gets "--detached" as an argument, never through the
+#   environment: the Moonraker it starts would inherit the variable and its
+#   next self-restart would run inline and die with it (v1.2.2, 15:28/15:31).
+#   It logs its steps to /tmp/octera-supervisorctl.log.
+#
 # SHIM_INIT_DIR / SHIM_RUN_DIR / SHIM_PROC override the system paths (tests).
+
+# The caller may run with a reduced PATH (setsid, usleep live in /usr/bin).
+PATH="/bin:/sbin:/usr/bin:/usr/sbin${PATH:+:$PATH}"
+export PATH
+SELF="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+DETACHED=0
+if [ "$1" = "--detached" ]; then DETACHED=1; shift; fi
+DETACH_LOG="${SHIM_DETACH_LOG:-/tmp/octera-supervisorctl.log}"
 
 INIT_DIR="${SHIM_INIT_DIR:-/etc/init.d}"
 RUN_DIR="${SHIM_RUN_DIR:-/var/run}"
@@ -150,19 +163,42 @@ start() {
   fi
 }
 
+log() { [ "$DETACHED" = 1 ] && echo "$(date +%T) $$ $*"; return 0; }
+
+wait_running() { # wait_running <service>: up to 10 s for its pid file process
+  for i in $(seq 100); do
+    pid="$(cat "$(get_pid_file "$1")" 2>/dev/null)"
+    [ -n "$pid" ] && [ -d "$PROC/$pid" ] && return 0
+    usleep 100000
+  done
+  return 1
+}
+
 restart() {
   service="$1"
   script_path="$(get_script_path $service)"
   [[ -f "$script_path" ]] || return 0
-  if [ "$service" = "moonraker" ] && [ -z "$SHIM_DETACHED" ]; then
+  if [ "$service" = "moonraker" ] && [ "$DETACHED" = 0 ]; then
     # Moonraker runs this as its child and kills it while shutting down:
     # leave its process tree and let the caller return at once.
-    ( SHIM_DETACHED=1 setsid "$0" restart moonraker </dev/null >/dev/null 2>&1 & )
+    ( setsid "$SELF" --detached restart moonraker </dev/null >"$DETACH_LOG" 2>&1 & )
     return 0
   fi
-  [ -n "$SHIM_DETACHED" ] && usleep 500000   # let the caller see us return
+  if [ "$DETACHED" = 1 ]; then
+    log "detached restart of $service"
+    usleep 500000   # let the caller see us return
+  fi
   stop "$service"
+  log "stopped $service"
   start "$service"
+  if [ "$DETACHED" = 1 ]; then
+    if ! wait_running "$service"; then
+      log "$service not running after start, retrying"
+      start "$service"
+      wait_running "$service" || log "$service still not running"
+    fi
+    log "started $service pid $(cat "$(get_pid_file "$service")" 2>/dev/null)"
+  fi
 }
 
 main() {

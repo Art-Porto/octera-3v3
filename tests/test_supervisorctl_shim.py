@@ -8,7 +8,10 @@ This suite guards what can be checked offline:
 - stop reaps the whole process tree of the service (2026-11-05: the old
   OctoEverywhere python survived a restart next to the new one);
 - "restart moonraker" runs detached with setsid (2026-11-05: Moonraker
-  restarted itself after an update and never came back).
+  restarted itself after an update and never came back), with the detach
+  flag passed as an argument: v1.2.2 passed it in the environment, the new
+  Moonraker inherited it and its next self-restart ran inline and died;
+- PATH holds the system dirs (a caller with PATH=/bin had no setsid).
 """
 
 from __future__ import annotations
@@ -53,8 +56,14 @@ def run() -> dict:
     check("reap escalates to SIGKILL", "kill -9" in reap)
     check("tree_of never includes the shim itself", '[ "$1" = "$$" ] && return 0' in body(text, "tree_of"))
     restart = body(text, "restart")
-    check("restart moonraker is detached with setsid",
-          '"$service" = "moonraker"' in restart and "setsid" in restart and "SHIM_DETACHED=1" in restart)
+    check("restart moonraker is detached with setsid and an argument",
+          '"$service" = "moonraker"' in restart and 'setsid "$SELF" --detached restart moonraker' in restart)
+    check("no detach flag in the environment", "SHIM_DETACHED" not in text)
+    check("detached run closes stdin and redirects output",
+          '</dev/null >"$DETACH_LOG" 2>&1 &' in restart)
+    check("PATH holds the system dirs before anything runs",
+          text.find('PATH="/bin:/sbin:/usr/bin:/usr/sbin') < text.find("SELF=") < text.find("main()"))
+    check("detached restart verifies the service came up", "wait_running" in restart)
     check("restart is stop then start (waits for the old tree)",
           0 <= restart.rfind('stop "$service"') < restart.rfind('start "$service"')
           and '"$script_path" restart' not in restart)
