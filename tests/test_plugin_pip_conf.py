@@ -63,8 +63,8 @@ def run() -> dict:
     parser = configparser.ConfigParser()
     parser.read(CONF, encoding="utf-8")
     only = {p.strip() for p in parser.get("global", "only-binary", fallback="").split(",")}
-    check("conf: pillow and zstandard binary-only", {"pillow", "zstandard"} <= only, sorted(only))
-    check("conf: not :all: (pure packages may still upgrade)", ":all:" not in only)
+    check("conf: wheels only for every package", only == {":all:"}, sorted(only))
+    check("conf: no no-binary exception", not parser.get("global", "no-binary", fallback=""))
     check("conf: prefer-binary", parser.getboolean("global", "prefer-binary", fallback=False))
 
     with tempfile.TemporaryDirectory() as t:
