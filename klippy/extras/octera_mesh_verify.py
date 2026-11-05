@@ -8,6 +8,14 @@ even. When a probed point lands on a stored node the interpolation weight is
 zero and the comparison is the node itself, so an odd grid needs no second
 path.
 
+On the 3V3 the Creality firmware anchors every mesh at its own area center
+(the center reads exactly noz_ex_com, 0.040 mm), so a stored mesh and the
+check grid are levelled at different points. The check therefore splits the
+differences into an offset (their mean) and a shape (each difference minus
+the mean). The shape must fit the tolerance and the offset a guard; the
+stored mesh is then installed shifted by the offset, which gives the level a
+new mesh anchored at the part would give.
+
 Used by octera_mesh_reuse; see docs/design/MESH_REUSE_V3.md in the
 engineering repository.
 """
@@ -17,6 +25,7 @@ from __future__ import annotations
 import math
 
 VERIFY_MARGIN_MM = 5.0
+VERIFY_MAX_OFFSET_MM = 0.50
 
 
 def rounding_allowance(count):
@@ -81,20 +90,22 @@ def select_verify_grid(stored_bounds, stored_count, required_bounds, size=3,
 
 
 def compare_verify(stored_matrix, stored_bounds, verify_matrix, verify_bounds,
-                   tolerance):
+                   tolerance, max_offset=VERIFY_MAX_OFFSET_MM):
     """Compare a probed grid with the stored mesh interpolated at its points.
 
     verify_bounds are the bounds bed_mesh actually probed (mesh_min/max after
     the check), so the floored spacing of the check grid is accounted for.
+    deviations and max_deviation are the shape (offset removed); offset is
+    the mean difference, to add to the stored mesh when it is installed.
     """
     result = {"pass": False, "max_deviation": None, "deviations": [],
-              "method": "bilinear"}
+              "offset": None, "method": "bilinear-shape"}
     size = len(verify_matrix)
     if size < 2 or any(len(row) != size for row in verify_matrix):
         result["reason"] = "VERIFY_DIMENSION_MISMATCH"
         return result
     xs, ys = grid_points(verify_bounds, size)
-    worst = 0.0
+    raw = []
     for r, y in enumerate(ys):
         for c, x in enumerate(xs):
             measured = float(verify_matrix[r][c])
@@ -102,10 +113,23 @@ def compare_verify(stored_matrix, stored_bounds, verify_matrix, verify_bounds,
             if not (math.isfinite(measured) and math.isfinite(stored)):
                 result["reason"] = "VERIFY_NONFINITE"
                 return result
-            deviation = measured - stored
-            result["deviations"].append(round(deviation, 6))
-            worst = max(worst, abs(deviation))
+            raw.append(measured - stored)
+    offset = sum(raw) / len(raw)
+    shape = [value - offset for value in raw]
+    worst = max(abs(value) for value in shape)
+    result["offset"] = round(offset, 6)
+    result["deviations"] = [round(value, 6) for value in shape]
     result["max_deviation"] = worst
-    result["pass"] = worst <= float(tolerance)
-    result["reason"] = "VERIFY_PASS" if result["pass"] else "VERIFY_DEVIATION"
+    if abs(offset) > float(max_offset):
+        result["reason"] = "VERIFY_OFFSET"
+    elif worst > float(tolerance):
+        result["reason"] = "VERIFY_DEVIATION"
+    else:
+        result["pass"] = True
+        result["reason"] = "VERIFY_PASS"
     return result
+
+
+def shifted(matrix, offset):
+    """The stored matrix with the check offset added to every point."""
+    return [[float(value) + float(offset) for value in row] for row in matrix]

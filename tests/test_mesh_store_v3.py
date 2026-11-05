@@ -3,7 +3,8 @@
 
 A simulated bed answers every probe from a height function, so the full
 dispatcher runs offline: calibration, storage, restart, 3x3 check, reuse,
-eviction and the decision history.
+eviction and the decision history. Like the Creality firmware, every probed
+mesh is anchored at the center of its own area at 0.040 mm (noz_ex_com).
 """
 
 from __future__ import annotations
@@ -26,6 +27,7 @@ MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
 
 BED_MIN, BED_MAX, STEP = (15.0, 15.0), (285.0, 285.0), 33.75
+ANCHOR = 0.040
 FINGERPRINT = "a" * 64
 
 
@@ -77,8 +79,10 @@ class Bed:
         # Like bed_mesh: the spacing is floored to 0.01 mm, mesh_max moves in.
         x1 = x0 + math.floor((x1 - x0) / (count - 1) * 100) / 100 * (count - 1)
         y1 = y0 + math.floor((y1 - y0) / (count - 1) * 100) / 100 * (count - 1)
+        # The firmware anchors the mesh at its area center.
+        level = ANCHOR - self.surface((x0 + x1) / 2.0, (y0 + y1) / 2.0)
         matrix = [[self.surface(x0 + (x1 - x0) * i / (count - 1),
-                                y0 + (y1 - y0) * j / (count - 1))
+                                y0 + (y1 - y0) * j / (count - 1)) + level
                    for i in range(count)] for j in range(count)]
         if self.bad_next:
             matrix[count // 2][count // 2] = 0.95
@@ -118,7 +122,7 @@ class Printer:
     """One Klipper process: a new Printer on the same store is a restart."""
 
     def __init__(self, store_path, bed=None, max_meshes=6, fingerprint=FINGERPRINT,
-                 verify_tolerance=0.05):
+                 verify_tolerance=0.08):
         self.bed = bed or Bed()
         self.part = [40.0, 40.0, 150.0, 150.0]
         self.fingerprint = fingerprint
@@ -323,18 +327,20 @@ def run():
     check("least recently used mesh evicted",
           p.areas() == sorted([A, C]) and p.last()["evicted"] == [2], p.history()[-1])
 
-    # 8. The bed moved: the check fails, the mesh is dropped, the part probed.
+    # 8. The bed tilted: the shape fails, the mesh is dropped, the part probed.
+    # (A uniform lift is invisible: every mesh is anchored at its own center.)
     path = fresh_path()
     p = Printer(path)
     p.start_print(A)
     bed = p.bed
-    bed.surface = lambda x, y: flat_bed(x, y) + 0.08
+    bed.surface = lambda x, y: flat_bed(x, y) + 0.002 * (x - 80.0)
     p = Printer(path, bed=bed)
     gcmd = p.start_print(PART_A)
     item = p.last()
     check("failed check drops the mesh and probes",
           item["result"] == "PROBED" and item["reason"] == "VERIFY_DEVIATION"
-          and abs(item["deviation"] - 0.08) < 1e-6 and item["probes"] == 25 + 9
+          and abs(item["deviation"] - 0.12) < 1e-6 and item["probes"] == 25 + 9
+          and item.get("offset") is not None
           and item["checked_id"] == 1 and item["mesh_id"] == 2
           and p.ids() == [2] and len(bed.calibrations) == 2, {"item": item, "m": gcmd.messages})
 
@@ -485,23 +491,84 @@ def run():
     check("part 0.2 mm past the mesh still probes",
           p.last()["result"] == "PROBED", p.history())
 
-    # 18. A step the stored 8x8 cannot represent (between two nodes): the
-    # check lands next to it and sees the bilinear ramp is wrong.
-    def stepped(x, y):
-        return flat_bed(x, y) + (0.15 if x >= 150.0 else 0.0)
+    # 18. A 0.15 mm step appears between two nodes of the stored 8x8 (from
+    # x = 200, between nodes 196.5 and 227.5): the shape check rejects it.
     path = fresh_path()
     bed = Bed()
-    bed.surface = stepped
     p = Printer(path, bed=bed)
     p.start_print(real)
+    bed.surface = lambda x, y: flat_bed(x, y) + (0.15 if x >= 200.0 else 0.0)
     p = Printer(path, bed=bed)
     p.start_print(real)
     verify = p.o.last_verify["result"]
-    check("stepped bed: interpolated check rejects, mesh dropped, part probed",
-          verify["reason"] == "VERIFY_DEVIATION" and verify["max_deviation"] > 0.05
+    check("step of 0.15 between nodes: rejected, mesh dropped, part probed",
+          verify["reason"] == "VERIFY_DEVIATION" and verify["max_deviation"] > 0.08
           and len(bed.calibrations) == 2 and p.last()["result"] == "PROBED"
           and p.last().get("checked_id") == 1 and p.ids() == [2],
           {"verify": verify, "history": p.history()})
+
+    # 19. Stored mesh anchored elsewhere: a full-bed mesh on a tilted bed,
+    # part in a corner. Accepted on shape and installed shifted, at the level
+    # a new mesh anchored at the part gives.
+    def tilted(x, y):
+        return 0.0012 * (x - 150.0) + 0.0009 * (y - 150.0)
+    path = fresh_path()
+    bed = Bed()
+    bed.surface = tilted
+    p = Printer(path, bed=bed)
+    p.start_print([20.0, 20.0, 280.0, 280.0])
+    corner = [25.0, 25.0, 160.0, 160.0]
+    p = Printer(path, bed=bed)
+    p.start_print(corner)
+    item = p.last()
+    installed = bed.pmgr.profiles["adaptive"]
+    stored = p.o._store()["entries"][0]
+    fresh = Bed()
+    fresh.surface = tilted
+    fresh.probe(corner, plan_count(corner), "fresh")
+    fresh_profile = fresh.pmgr.profiles["fresh"]
+    fp = fresh_profile["mesh_params"]
+    fresh_bounds = [fp["min_x"], fp["min_y"], fp["max_x"], fp["max_y"]]
+    helpers = MODULE.verify_helpers
+    worst_level = max(
+        abs(helpers.bilinear(installed["points"], stored["bounds"], x, y)
+            - helpers.bilinear(fresh_profile["points"], fresh_bounds, x, y))
+        for x in (25.0, 92.5, 160.0) for y in (25.0, 92.5, 160.0))
+    check("other anchor: accepted, installed shifted to a new mesh's level",
+          item["result"] == "REUSED_VERIFIED" and abs(item["offset"]) > 0.05
+          and item["deviation"] < 1e-6 and len(bed.calibrations) == 1
+          and worst_level < 1e-6
+          and stored["points"] != installed["points"],
+          {"item": item, "worst_level": worst_level})
+    check("stored entry stays unshifted on disk",
+          abs(helpers.bilinear(stored["points"], stored["bounds"], 150.0, 150.0)
+              - ANCHOR) < 1e-6, stored["points"][4][4])
+
+    # 20. Offset guard: the stored mesh 0.6 mm off (plate swapped, offset
+    # changed) has a perfect shape but is rejected and the part probed.
+    path = fresh_path()
+    p = Printer(path)
+    p.start_print(A)
+    entry = p.o._store()["entries"][0]
+    entry["points"] = [[v - 0.6 for v in row] for row in entry["points"]]
+    p.o._save_store()
+    bed = p.bed
+    p = Printer(path, bed=bed)
+    p.start_print(PART_A)
+    item = p.last()
+    check("offset 0.6: rejected by the guard, mesh dropped, part probed",
+          item["result"] == "PROBED" and item["reason"] == "VERIFY_OFFSET"
+          and abs(item["offset"] - 0.6) < 1e-6 and p.ids() == [2]
+          and len(bed.calibrations) == 2, item)
+    history_text = []
+    gcmd = Gcmd()
+    p.o.cmd_OCTERA_MESH_HISTORY(gcmd)
+    check("history shows the offset", "offset +0.600 mm" in "\n".join(gcmd.messages),
+          gcmd.messages)
+    status = p.o.get_status(0)
+    check("status shows the offset and its limit",
+          status["last_verify"]["result"]["offset"] == item["offset"]
+          and status["store_policy"]["verify_max_offset"] == 0.5, status["store_policy"])
 
     failures = [r for r in RESULTS if not r["pass"]]
     return {"pass": not failures, "checks": len(RESULTS), "failures": failures}

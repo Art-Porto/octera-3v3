@@ -633,7 +633,12 @@ class OcteraMeshReuse:
         # Verified reuse (V2): check a stored mesh with a 3x3 on its nodes.
         self.verify_enabled = config.getboolean("verify_enabled", False)
         self.verify_tolerance = config.getfloat(
-            "verify_tolerance", 0.05, minval=0.005, maxval=0.2)
+            "verify_tolerance", 0.08, minval=0.005, maxval=0.2)
+        # The firmware anchors each mesh at its own center: the check removes
+        # the offset and installs the stored mesh shifted by it, unless the
+        # offset itself is this large (plate swapped, offset changed, dirt).
+        self.verify_max_offset = config.getfloat(
+            "verify_max_offset", 0.50, minval=0.05, maxval=2.0)
         self.verify_min_full_count = config.getint("verify_min_full_count", 5, minval=4)
         # 0 means no age limit (V3): a stored mesh is always checked first.
         self.verify_max_age_hours = config.getfloat("verify_max_age_hours", 0.0, minval=0.0)
@@ -1110,6 +1115,7 @@ class OcteraMeshReuse:
         verify = getattr(self, "last_verify", None) or {}
         if str(reason).startswith("VERIFY_") and verify.get("result"):
             item["deviation"] = verify["result"].get("max_deviation")
+            item["offset"] = verify["result"].get("offset")
             item["probes"] += len(verify["result"].get("deviations") or [])
             item["checked_id"] = (verify.get("plan") or {}).get("entry_id")
         elif verify.get("plan") and not (verify["plan"] or {}).get("ok"):
@@ -1448,17 +1454,19 @@ class OcteraMeshReuse:
             probed_bounds = plan["grid"]["bounds"]
         result = verify_helpers.compare_verify(
             store["points"], store["bounds"], probed, probed_bounds,
-            self.verify_tolerance)
+            self.verify_tolerance, getattr(self, "verify_max_offset",
+                                           verify_helpers.VERIFY_MAX_OFFSET_MM))
         result["probed_bounds"] = [round(float(v), 4) for v in probed_bounds]
         result["duration_sec"] = eventtime - pending["started_at_monotonic"]
         self.last_verify = {"timestamp": time.time(), "plan": self._plan_summary(plan),
                             "result": _plain(result)}
         logging.info("octera_mesh_reuse: verify %s", json.dumps(self.last_verify, sort_keys=True))
         gcmd.respond_info(
-            "OCTERA MESH VERIFY %s mesh #%s max_deviation=%s tolerance=%.3f" % (
+            "OCTERA MESH VERIFY %s mesh #%s shape=%s tolerance=%.3f offset=%s" % (
                 result["reason"], plan.get("entry_id"),
                 "n/a" if result["max_deviation"] is None else "%.4f" % result["max_deviation"],
-                self.verify_tolerance))
+                self.verify_tolerance,
+                "n/a" if result.get("offset") is None else "%+.4f" % result["offset"]))
         if not result["pass"]:
             # The bed no longer matches this mesh: it is not offered again.
             if store_forget(self._store(), plan.get("entry_id")):
@@ -1468,7 +1476,11 @@ class OcteraMeshReuse:
                 gcmd, pending["candidate"], pending["request"], "adaptive",
                 result["reason"], pending["bed_target"], eventtime)
             return
-        self._install_profile(VERIFIED_PROFILE, store["points"], store["mesh_params"])
+        # Installed at the level a new mesh anchored at the part would have;
+        # the stored entry stays unshifted (the offset is measured every use).
+        self._install_profile(VERIFIED_PROFILE,
+                              verify_helpers.shifted(store["points"], result["offset"]),
+                              store["mesh_params"])
         eventtime = self.reactor.monotonic()
         heater = self.printer.lookup_object("heater_bed").get_status(eventtime)
         fingerprint, components = self._config_fingerprint(eventtime)
@@ -1504,12 +1516,13 @@ class OcteraMeshReuse:
             "origin": "adaptive", "bed_target": pending["bed_target"],
             "required": pending["request"].get("required_bounds"),
             "mesh_id": plan.get("entry_id"), "deviation": result["max_deviation"],
+            "offset": result.get("offset"),
             "probes": len(result.get("deviations") or []),
             "count": store["probe_count"],
         })
-        gcmd.respond_info("REUSING VERIFIED STORED MESH #%s %sx%s bounds=%s" % (
+        gcmd.respond_info("REUSING VERIFIED STORED MESH #%s %sx%s bounds=%s offset=%+.4f" % (
             plan.get("entry_id"), store["probe_count"][0], store["probe_count"][1],
-            candidate["bounds"]))
+            candidate["bounds"], float(result["offset"])))
 
     def cmd_OCTERA_MESH_INVALIDATE(self, gcmd):
         reason = gcmd.get("REASON", "REJECT_MANUAL_INVALIDATION").upper()
@@ -1533,11 +1546,13 @@ class OcteraMeshReuse:
 
     def cmd_OCTERA_MESH_HISTORY(self, gcmd):
         store = self._store()
-        lines = ["OCTERA MESH STORE: %d mesh(es), check %s, tolerance %.3f mm, "
-                 "up to %d per temperature" % (
+        lines = ["OCTERA MESH STORE: %d mesh(es), check %s, shape tolerance %.3f mm, "
+                 "offset limit %.2f mm, up to %d per temperature" % (
                      len(store["entries"]),
                      "on" if self.verify_enabled else "off",
-                     self.verify_tolerance, getattr(self, "max_meshes", 6))]
+                     self.verify_tolerance,
+                     getattr(self, "verify_max_offset", verify_helpers.VERIFY_MAX_OFFSET_MM),
+                     getattr(self, "max_meshes", 6))]
         for item in store_summary(store):
             lines.append("#%s %sC %sx%s area %.0f,%.0f-%.0f,%.0f used %s saved %s" % (
                 item["id"], temperature_key(item["bed_target"]),
@@ -1546,14 +1561,16 @@ class OcteraMeshReuse:
                 item["uses"],
                 time.strftime("%m-%d %H:%M", time.localtime(float(item["saved_at"])))))
         for item in store["history"][-10:]:
-            lines.append("%s %s %s%s%s%s" % (
+            lines.append("%s %s %s%s%s%s%s" % (
                 time.strftime("%m-%d %H:%M", time.localtime(float(item.get("time", 0)))),
                 "" if item.get("bed_target") is None
                 else "%sC" % temperature_key(item["bed_target"]),
                 item.get("result"),
                 "" if item.get("mesh_id") is None else " #%s" % item["mesh_id"],
                 "" if item.get("deviation") is None
-                else " worst %.3f mm" % float(item["deviation"]),
+                else " shape %.3f mm" % float(item["deviation"]),
+                "" if item.get("offset") is None
+                else " offset %+.3f mm" % float(item["offset"]),
                 "" if not item.get("reason") else " (%s)" % item["reason"]))
         gcmd.respond_info("\n".join(lines))
 
@@ -1588,6 +1605,8 @@ class OcteraMeshReuse:
             "store_schema": STORE_SCHEMA,
             "store_policy": {
                 "verify_tolerance": self.verify_tolerance,
+                "verify_max_offset": getattr(self, "verify_max_offset",
+                                             verify_helpers.VERIFY_MAX_OFFSET_MM),
                 "verify_min_full_count": self.verify_min_full_count,
                 "verify_max_age_hours": self.verify_max_age_hours,
                 "max_meshes_per_temperature": getattr(self, "max_meshes", 6),

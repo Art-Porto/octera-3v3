@@ -78,10 +78,26 @@ def run() -> dict:
         checks += 1
         if not result["pass"] or result["max_deviation"] > 1e-9:
             failures.append({"plane": count, "result": result})
-        shifted = [[v + 0.06 for v in row] for row in checked]
+        # A level offset (each mesh anchored at its own center) is not an
+        # error: it passes, is reported, and the installed mesh carries it.
+        lifted = [[v + 0.06 for v in row] for row in checked]
+        result = MODULE.compare_verify(matrix, stored, lifted, grid["bounds"], 0.05)
         checks += 1
-        if MODULE.compare_verify(matrix, stored, shifted, grid["bounds"], 0.05)["pass"]:
-            failures.append({"offset_passed": count})
+        if (not result["pass"] or abs(result["offset"] - 0.06) > 1e-6
+                or result["max_deviation"] > 1e-9):
+            failures.append({"offset_not_separated": count, "result": result})
+        installed = MODULE.shifted(matrix, result["offset"])
+        xs, ys = MODULE.grid_points(grid["bounds"], 3)
+        checks += 1
+        if any(abs(MODULE.bilinear(installed, stored, x, y) - lifted[r][c]) > 1e-9
+               for r, y in enumerate(ys) for c, x in enumerate(xs)):
+            failures.append({"installed_level": count})
+        # Beyond the offset guard: rejected even with a perfect shape.
+        far = [[v + 0.6 for v in row] for row in checked]
+        result = MODULE.compare_verify(matrix, stored, far, grid["bounds"], 0.05)
+        checks += 1
+        if result["pass"] or result["reason"] != "VERIFY_OFFSET":
+            failures.append({"offset_guard": count, "result": result})
 
     # On nodes the weight is zero: the comparison is the node itself.
     matrix = [[rng.uniform(-0.2, 0.2) for _ in range(5)] for _ in range(5)]
@@ -89,7 +105,7 @@ def run() -> dict:
     nodes = [[matrix[j][i] for i in (0, 2, 4)] for j in (0, 2, 4)]
     result = MODULE.compare_verify(matrix, stored, nodes, stored, 0.0001)
     checks += 1
-    if not result["pass"] or result["max_deviation"] > 1e-12:
+    if not result["pass"] or result["max_deviation"] > 1e-12 or abs(result["offset"]) > 1e-12:
         failures.append({"on_node": result})
 
     # A step between nodes: the check sees it where the stored mesh cannot.

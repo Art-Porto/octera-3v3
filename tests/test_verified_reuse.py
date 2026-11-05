@@ -167,11 +167,14 @@ def run() -> dict:
     if ("PROFILE=octera_verify" not in joined or "BED_MESH_PROFILE LOAD=adaptive" not in joined
             or "BED_MESH_CALIBRATE\n" in joined + "\n"
             or (o.metadata or {}).get("origin") != "verified"
-            or bed.probed != STORED):
+            or any(abs(a - b - 0.01) > 1e-9 for ra, rb in zip(bed.probed, STORED)
+                   for a, b in zip(ra, rb))):
         failures.append({"pass_flow": o.scripts, "meta": (o.metadata or {}).get("origin")})
 
-    # Verification fails: falls back to the normal adaptive calibration.
-    bad = [[v + 0.08 for v in row] for row in good]
+    # Verification fails on shape (a level offset alone would pass): falls
+    # back to the normal adaptive calibration.
+    bad = [row[:] for row in good]
+    bad[0][0] += 0.12
     o, bed = make_owner(path, verify_probe=bad)
     o.cmd_OCTERA_MESH_REUSE_OR_CALIBRATE(Gcmd())
     checks += 1
