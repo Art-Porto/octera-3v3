@@ -170,6 +170,17 @@ if [ -d "$MATPLOTLIB" ] && ! cmp -s "$REPO/files/$SO" "$MATPLOTLIB/$SO"; then
   change "install matplotlib $SO" cp "$REPO/files/$SO" "$MATPLOTLIB/$SO"
 fi
 
+# --- pip in the plugin envs: never compile on the printer ------------------
+# Each plugin venv gets files/pip/plugin-pip.conf as <venv>/pip.conf.
+for env in octoeverywhere-env octoapp-env; do
+  venv="$ROOT/usr/data/$env"
+  [ -x "$venv/bin/python" ] || [ -x "$venv/bin/python3" ] || continue
+  if ! cmp -s "$REPO/files/pip/plugin-pip.conf" "$venv/pip.conf"; then
+    backup "$venv/pip.conf"
+    change "install pip.conf (binary-only for compiled packages) in $env"       cp "$REPO/files/pip/plugin-pip.conf" "$venv/pip.conf"
+  fi
+done
+
 # --- Moonraker update manager ---------------------------------------------
 if [ -f "$MOONRAKER_CFG" ]; then
   if grep -q "^\[update_manager Creality-Helper-Script\]" "$MOONRAKER_CFG"; then

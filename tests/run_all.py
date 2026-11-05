@@ -19,6 +19,7 @@ SUITES = [
     "tests/test_verified_reuse.py",
     "tests/test_mesh_store_v3.py",
     "tests/test_install_links.py",
+    "tests/test_plugin_pip_conf.py",
     "tests/test_first_layer.py",
 ]
 
