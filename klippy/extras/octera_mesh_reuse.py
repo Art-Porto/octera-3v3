@@ -1357,7 +1357,7 @@ class OcteraMeshReuse:
         grid = verify_helpers.select_verify_grid(
             entry["bounds"], entry["probe_count"], request["required_bounds"])
         if grid is None:
-            return "VERIFY_NO_GRID", None
+            return "VERIFY_NOT_COVERED", None
         return None, {"grid": grid, "store_sanity": sanity}
 
     def _verify_plan(self, request, bed_target):
@@ -1441,9 +1441,15 @@ class OcteraMeshReuse:
         eventtime = self.reactor.monotonic()
         plan = pending["plan"]
         store = plan["store"]
-        probed = self._mesh_candidate(eventtime).get("probed_matrix") or []
+        checked = self._mesh_candidate(eventtime)
+        probed = checked.get("probed_matrix") or []
+        probed_bounds = checked.get("bounds") or plan["grid"]["bounds"]
+        if probed_bounds[2] <= probed_bounds[0] or probed_bounds[3] <= probed_bounds[1]:
+            probed_bounds = plan["grid"]["bounds"]
         result = verify_helpers.compare_verify(
-            store["points"], plan["grid"], probed, self.verify_tolerance)
+            store["points"], store["bounds"], probed, probed_bounds,
+            self.verify_tolerance)
+        result["probed_bounds"] = [round(float(v), 4) for v in probed_bounds]
         result["duration_sec"] = eventtime - pending["started_at_monotonic"]
         self.last_verify = {"timestamp": time.time(), "plan": self._plan_summary(plan),
                             "result": _plain(result)}

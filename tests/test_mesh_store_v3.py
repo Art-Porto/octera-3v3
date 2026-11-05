@@ -265,8 +265,8 @@ def run():
     check("part across two areas probes only itself",
           bed.calibrations[-1][0] == across and p.areas() == sorted([A, B, across])
           and p.last()["result"] == "PROBED", p.areas())
-    check("its reason names the refusal", p.last().get("verify_skipped") == "VERIFY_NO_GRID"
-          or p.last().get("reason") == "REJECT_METADATA_MISSING", p.last())
+    check("its reason names the refusal",
+          p.last().get("verify_skipped") == "VERIFY_NOT_COVERED", p.last())
 
     # 4. A larger mesh replaces the smaller ones it covers.
     big = [20.0, 20.0, 280.0, 280.0]
@@ -462,9 +462,15 @@ def run():
           p.history())
     p = Printer(path, bed=p.bed)
     p.start_print(real)
-    check("8x8 after restart: no 3x3 fits its 7 intervals, probes",
-          p.last()["result"] == "PROBED" and p.last().get("verify_skipped") == "VERIFY_NO_GRID",
+    check("8x8 after restart: checked by interpolation and reused",
+          p.last()["result"] == "REUSED_VERIFIED" and p.last()["mesh_id"] == 1
+          and p.last()["probes"] == 9 and len(p.bed.calibrations) == 1,
           p.history())
+    # The check covers the part plus 5 mm, clipped to the stored 8x8.
+    stored = p.o._store()["entries"][0]["bounds"]
+    check("8x8 check spans the part, clipped to the mesh",
+          all(abs(a - b) < 0.002 for a, b in zip(p.bed.checks[-1], stored)),
+          [p.bed.checks[-1], stored])
     wide = [20.0, 20.0, 270.079, 270.079]     # 9x9, spacing 31.2599 -> 31.25
     path = fresh_path()
     p = Printer(path)
@@ -478,6 +484,24 @@ def run():
     p.start_print(beyond)
     check("part 0.2 mm past the mesh still probes",
           p.last()["result"] == "PROBED", p.history())
+
+    # 18. A step the stored 8x8 cannot represent (between two nodes): the
+    # check lands next to it and sees the bilinear ramp is wrong.
+    def stepped(x, y):
+        return flat_bed(x, y) + (0.15 if x >= 150.0 else 0.0)
+    path = fresh_path()
+    bed = Bed()
+    bed.surface = stepped
+    p = Printer(path, bed=bed)
+    p.start_print(real)
+    p = Printer(path, bed=bed)
+    p.start_print(real)
+    verify = p.o.last_verify["result"]
+    check("stepped bed: interpolated check rejects, mesh dropped, part probed",
+          verify["reason"] == "VERIFY_DEVIATION" and verify["max_deviation"] > 0.05
+          and len(bed.calibrations) == 2 and p.last()["result"] == "PROBED"
+          and p.last().get("checked_id") == 1 and p.ids() == [2],
+          {"verify": verify, "history": p.history()})
 
     failures = [r for r in RESULTS if not r["pass"]]
     return {"pass": not failures, "checks": len(RESULTS), "failures": failures}

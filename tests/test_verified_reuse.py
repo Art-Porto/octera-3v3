@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verified reuse (V2): store, plan, verification probe and outcome.
+"""Verified reuse (V2/V3): store, plan, verification probe and outcome.
 
 The store is written in the v1 format, so this also covers its migration."""
 
@@ -8,6 +8,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import re
 import sys
 import tempfile
 import time
@@ -89,6 +90,7 @@ def make_owner(store_path, verify_probe=None):
                 bed.bounds = list(STORE_BOUNDS)
             elif line.startswith("_BED_MESH_CALIBRATE") and verify_probe is not None:
                 bed.active, bed.probed = "octera_verify", verify_probe
+                bed.bounds = [float(v) for v in re.findall(r"-?\d+\.\d+", line)[:4]]
             elif line == "OCTERA_MESH_VERIFY_FINISH":
                 o.cmd_OCTERA_MESH_VERIFY_FINISH(Gcmd())
     o.gcode = type("G", (), {"run_script_from_command": staticmethod(run)})()
@@ -155,7 +157,9 @@ def run() -> dict:
     write_store(path)
     o, bed = make_owner(path)
     grid = MODULE.verify_helpers.select_verify_grid(STORE_BOUNDS, [7, 7], [120, 120, 180, 180])
-    good = [[STORED[j][i] + 0.01 for i in grid["x_index"]] for j in grid["y_index"]]
+    xs, ys = MODULE.verify_helpers.grid_points(grid["bounds"], 3)
+    good = [[MODULE.verify_helpers.bilinear(STORED, STORE_BOUNDS, x, y) + 0.01 for x in xs]
+            for y in ys]
     o, bed = make_owner(path, verify_probe=good)
     o.cmd_OCTERA_MESH_REUSE_OR_CALIBRATE(Gcmd())
     checks += 1
