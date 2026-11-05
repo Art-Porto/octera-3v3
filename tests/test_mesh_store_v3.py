@@ -341,7 +341,7 @@ def run():
     check("failed check drops the mesh and probes",
           item["result"] == "PROBED" and item["reason"] == "VERIFY_DEVIATION"
           and abs(item["deviation"] - 0.12) < 1e-6 and item["probes"] == 25 + 9
-          and item.get("offset") is not None
+          and item.get("offset_measured") is not None
           and item["checked_id"] == 1 and item["mesh_id"] == 2
           and p.ids() == [2] and len(bed.calibrations) == 2, {"item": item, "m": gcmd.messages})
 
@@ -536,11 +536,22 @@ def run():
             - helpers.bilinear(fresh_profile["points"], fresh_bounds, x, y))
         for x in (25.0, 92.5, 160.0) for y in (25.0, 92.5, 160.0))
     check("other anchor: accepted, installed shifted to a new mesh's level",
-          item["result"] == "REUSED_VERIFIED" and abs(item["offset"]) > 0.05
+          item["result"] == "REUSED_VERIFIED" and abs(item["offset_measured"]) > 0.05
           and item["deviation"] < 1e-6 and len(bed.calibrations) == 1
           and worst_level < 1e-6
           and stored["points"] != installed["points"],
           {"item": item, "worst_level": worst_level})
+    # The level comes from the anchor: the stored mesh read at the center of
+    # the calibration area. Off the stored center it is not zero, and with a
+    # noise-free 3x3 it equals the measured offset.
+    verify = p.o.last_verify["result"]
+    check("off-center part: predicted shift from the anchor, not zero",
+          abs(item["shift_predicted"] - (ANCHOR - helpers.bilinear(
+              stored["points"], stored["bounds"], 92.5, 92.5))) < 1e-6
+          and abs(item["shift_predicted"]) > 0.05
+          and abs(item["shift_predicted"] - item["offset_measured"]) < 1e-6
+          and verify["anchor"] == ANCHOR and verify["anchor_source"] == "default"
+          and verify["shift_area"] == corner, {"item": item, "verify": verify})
     check("stored entry stays unshifted on disk",
           abs(helpers.bilinear(stored["points"], stored["bounds"], 150.0, 150.0)
               - ANCHOR) < 1e-6, stored["points"][4][4])
@@ -559,16 +570,16 @@ def run():
     item = p.last()
     check("offset 0.6: rejected by the guard, mesh dropped, part probed",
           item["result"] == "PROBED" and item["reason"] == "VERIFY_OFFSET"
-          and abs(item["offset"] - 0.6) < 1e-6 and p.ids() == [2]
+          and abs(item["offset_measured"] - 0.6) < 1e-6 and p.ids() == [2]
           and len(bed.calibrations) == 2, item)
     history_text = []
     gcmd = Gcmd()
     p.o.cmd_OCTERA_MESH_HISTORY(gcmd)
-    check("history shows the offset", "offset +0.600 mm" in "\n".join(gcmd.messages),
+    check("history shows the offset", "offset_measured +0.600 mm" in "\n".join(gcmd.messages),
           gcmd.messages)
     status = p.o.get_status(0)
     check("status shows the offset and its limit",
-          status["last_verify"]["result"]["offset"] == item["offset"]
+          status["last_verify"]["result"]["offset"] == item["offset_measured"]
           and status["store_policy"]["verify_max_offset"] == 0.5, status["store_policy"])
 
     # 21. A stored mesh that zig-zags along its first row is never checked:

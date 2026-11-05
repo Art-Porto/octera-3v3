@@ -11,10 +11,17 @@ path.
 On the 3V3 the Creality firmware anchors every mesh at its own area center
 (the center reads exactly noz_ex_com, 0.040 mm), so a stored mesh and the
 check grid are levelled at different points. The check therefore splits the
-differences into an offset (their mean) and a shape (each difference minus
-the mean). The shape must fit the tolerance and the offset a guard; the
-stored mesh is then installed shifted by the offset, which gives the level a
-new mesh anchored at the part would give.
+differences into a measured offset (their mean) and a shape (each difference
+minus the mean). The shape must fit the tolerance; the measured offset is
+only a guard against a large change (plate swapped, Z offset changed).
+
+The installed level does not come from the measured offset: the 3x3 is
+anchored at its own center too, so the noise of that one point moves the
+eight others with it and the mean does not cancel it (2026-11-05: measured
+-0.055, true 0.000). A new mesh of the part would read the anchor at the
+center of its area, so the stored mesh is shifted by the predicted amount
+anchor - bilinear(stored, center of the calibration area), which reproduces
+it without any probe noise.
 
 Used by octera_mesh_reuse; see docs/design/MESH_REUSE_V3.md in the
 engineering repository.
@@ -128,6 +135,17 @@ def compare_verify(stored_matrix, stored_bounds, verify_matrix, verify_bounds,
         result["pass"] = True
         result["reason"] = "VERIFY_PASS"
     return result
+
+
+def predicted_shift(stored_matrix, stored_bounds, area_bounds, anchor):
+    """Shift that gives the stored mesh the level of a new mesh of the area.
+
+    The firmware sets a new mesh to `anchor` at the center of the area it
+    probes; area_bounds are the bounds a new calibration would use.
+    """
+    cx = (float(area_bounds[0]) + float(area_bounds[2])) / 2.0
+    cy = (float(area_bounds[1]) + float(area_bounds[3])) / 2.0
+    return float(anchor) - bilinear(stored_matrix, stored_bounds, cx, cy)
 
 
 def shifted(matrix, offset):

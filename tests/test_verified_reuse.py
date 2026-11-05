@@ -162,13 +162,18 @@ def run() -> dict:
             for y in ys]
     o, bed = make_owner(path, verify_probe=good)
     o.cmd_OCTERA_MESH_REUSE_OR_CALIBRATE(Gcmd())
+    # Installed at the anchor (0.04, the default: no prtouch_v2 here) at the
+    # center of the calibration area, not at the measured +0.01.
+    shift = 0.04 - MODULE.verify_helpers.bilinear(STORED, STORE_BOUNDS, 150.0, 150.0)
     checks += 1
     joined = "\n".join(o.scripts)
     if ("PROFILE=octera_verify" not in joined or "BED_MESH_PROFILE LOAD=adaptive" not in joined
             or "BED_MESH_CALIBRATE\n" in joined + "\n"
             or (o.metadata or {}).get("origin") != "verified"
-            or any(abs(a - b - 0.01) > 1e-9 for ra, rb in zip(bed.probed, STORED)
-                   for a, b in zip(ra, rb))):
+            or any(abs(a - b - shift) > 1e-9 for ra, rb in zip(bed.probed, STORED)
+                   for a, b in zip(ra, rb))
+            or abs(o.metadata["verify"]["offset_measured"] - 0.01) > 1e-9
+            or abs(o.metadata["verify"]["shift_predicted"] - shift) > 1e-9):
         failures.append({"pass_flow": o.scripts, "meta": (o.metadata or {}).get("origin")})
 
     # Verification fails on shape (a level offset alone would pass): falls

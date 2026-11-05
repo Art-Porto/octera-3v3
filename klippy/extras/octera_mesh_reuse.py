@@ -49,6 +49,9 @@ STATUS_HISTORY = 20
 # "default" profile in memory is never replaced by a stored copy.
 VERIFIED_PROFILE = "adaptive"
 # CALIBRATE reasons a verified stored mesh may stand in for.
+# noz_ex_com of the stock printer.cfg, used only if the config has none.
+DEFAULT_ANCHOR_MM = 0.04
+
 VERIFIABLE_REASONS = {
     "REJECT_NO_MESH", "REJECT_METADATA_MISSING", "REJECT_THERMAL_SESSION",
     "REJECT_COVERAGE", "REJECT_DENSITY", "REJECT_TEMP", "REJECT_MESH_CHANGED",
@@ -687,8 +690,9 @@ class OcteraMeshReuse:
         self.verify_tolerance = config.getfloat(
             "verify_tolerance", 0.08, minval=0.005, maxval=0.2)
         # The firmware anchors each mesh at its own center: the check removes
-        # the offset and installs the stored mesh shifted by it, unless the
-        # offset itself is this large (plate swapped, offset changed, dirt).
+        # the measured offset before judging the shape, and refuses the mesh
+        # if the offset itself is this large (plate swapped, offset changed,
+        # dirt). The installed level comes from the anchor, not from it.
         self.verify_max_offset = config.getfloat(
             "verify_max_offset", 0.50, minval=0.05, maxval=2.0)
         self.verify_min_full_count = config.getint("verify_min_full_count", 5, minval=4)
@@ -815,6 +819,16 @@ class OcteraMeshReuse:
     def _settings(self, eventtime):
         configfile = self.printer.lookup_object("configfile")
         return configfile.get_status(eventtime).get("settings", {})
+
+    def _anchor(self, eventtime):
+        """Height the firmware gives a new mesh at its area center."""
+        try:
+            value = self._settings(eventtime).get("prtouch_v2", {}).get("noz_ex_com")
+            if value is not None and math.isfinite(float(value)):
+                return float(value), "prtouch_v2.noz_ex_com"
+        except Exception:
+            logging.exception("octera_mesh_reuse: noz_ex_com not readable")
+        return DEFAULT_ANCHOR_MM, "default"
 
     def _kamp_status(self, eventtime):
         macro = self.printer.lookup_object("gcode_macro _KAMP_Settings", None)
@@ -1169,7 +1183,7 @@ class OcteraMeshReuse:
         verify = getattr(self, "last_verify", None) or {}
         if str(reason).startswith("VERIFY_") and verify.get("result"):
             item["deviation"] = verify["result"].get("max_deviation")
-            item["offset"] = verify["result"].get("offset")
+            item["offset_measured"] = verify["result"].get("offset")
             item["probes"] += len(verify["result"].get("deviations") or [])
             item["checked_id"] = (verify.get("plan") or {}).get("entry_id")
         elif verify.get("plan") and not (verify["plan"] or {}).get("ok"):
@@ -1515,16 +1529,31 @@ class OcteraMeshReuse:
             self.verify_tolerance, getattr(self, "verify_max_offset",
                                            verify_helpers.VERIFY_MAX_OFFSET_MM))
         result["probed_bounds"] = [round(float(v), 4) for v in probed_bounds]
+        result["offset_measured"] = result.get("offset")
+        area = pending["request"].get("required_bounds") or store["bounds"]
+        anchor, anchor_source = self._anchor(eventtime)
+        if result.get("max_deviation") is not None:
+            result["shift_predicted"] = round(verify_helpers.predicted_shift(
+                store["points"], store["bounds"], area, anchor), 6)
+        else:
+            result["shift_predicted"] = None
+        result["anchor"] = anchor
+        result["anchor_source"] = anchor_source
+        result["shift_area"] = [round(float(v), 4) for v in area]
         result["duration_sec"] = eventtime - pending["started_at_monotonic"]
         self.last_verify = {"timestamp": time.time(), "plan": self._plan_summary(plan),
                             "result": _plain(result)}
         logging.info("octera_mesh_reuse: verify %s", json.dumps(self.last_verify, sort_keys=True))
         gcmd.respond_info(
-            "OCTERA MESH VERIFY %s mesh #%s shape=%s tolerance=%.3f offset=%s" % (
+            "OCTERA MESH VERIFY %s mesh #%s shape=%s tolerance=%.3f "
+            "offset_measured=%s shift_predicted=%s anchor=%.3f (%s)" % (
                 result["reason"], plan.get("entry_id"),
                 "n/a" if result["max_deviation"] is None else "%.4f" % result["max_deviation"],
                 self.verify_tolerance,
-                "n/a" if result.get("offset") is None else "%+.4f" % result["offset"]))
+                "n/a" if result.get("offset") is None else "%+.4f" % result["offset"],
+                "n/a" if result.get("shift_predicted") is None
+                else "%+.4f" % result["shift_predicted"],
+                anchor, anchor_source))
         if not result["pass"]:
             # The bed no longer matches this mesh: it is not offered again.
             if store_forget(self._store(), plan.get("entry_id")):
@@ -1534,10 +1563,11 @@ class OcteraMeshReuse:
                 gcmd, pending["candidate"], pending["request"], "adaptive",
                 result["reason"], pending["bed_target"], eventtime)
             return
-        # Installed at the level a new mesh anchored at the part would have;
-        # the stored entry stays unshifted (the offset is measured every use).
+        # Installed at the level a new mesh of the part would have (anchor at
+        # the center of its area); the stored entry stays unshifted.
         self._install_profile(VERIFIED_PROFILE,
-                              verify_helpers.shifted(store["points"], result["offset"]),
+                              verify_helpers.shifted(store["points"],
+                                                     result["shift_predicted"]),
                               store["mesh_params"])
         eventtime = self.reactor.monotonic()
         heater = self.printer.lookup_object("heater_bed").get_status(eventtime)
@@ -1574,13 +1604,17 @@ class OcteraMeshReuse:
             "origin": "adaptive", "bed_target": pending["bed_target"],
             "required": pending["request"].get("required_bounds"),
             "mesh_id": plan.get("entry_id"), "deviation": result["max_deviation"],
-            "offset": result.get("offset"),
+            "offset_measured": result.get("offset"),
+            "shift_predicted": result.get("shift_predicted"),
             "probes": len(result.get("deviations") or []),
             "count": store["probe_count"],
         })
-        gcmd.respond_info("REUSING VERIFIED STORED MESH #%s %sx%s bounds=%s offset=%+.4f" % (
-            plan.get("entry_id"), store["probe_count"][0], store["probe_count"][1],
-            candidate["bounds"], float(result["offset"])))
+        gcmd.respond_info(
+            "REUSING VERIFIED STORED MESH #%s %sx%s bounds=%s shift_predicted=%+.4f "
+            "offset_measured=%+.4f" % (
+                plan.get("entry_id"), store["probe_count"][0], store["probe_count"][1],
+                candidate["bounds"], float(result["shift_predicted"]),
+                float(result["offset"])))
 
     def cmd_OCTERA_MESH_INVALIDATE(self, gcmd):
         reason = gcmd.get("REASON", "REJECT_MANUAL_INVALIDATION").upper()
@@ -1619,7 +1653,7 @@ class OcteraMeshReuse:
                 item["uses"],
                 time.strftime("%m-%d %H:%M", time.localtime(float(item["saved_at"])))))
         for item in store["history"][-10:]:
-            lines.append("%s %s %s%s%s%s%s" % (
+            lines.append("%s %s %s%s%s%s%s%s" % (
                 time.strftime("%m-%d %H:%M", time.localtime(float(item.get("time", 0)))),
                 "" if item.get("bed_target") is None
                 else "%sC" % temperature_key(item["bed_target"]),
@@ -1627,8 +1661,11 @@ class OcteraMeshReuse:
                 "" if item.get("mesh_id") is None else " #%s" % item["mesh_id"],
                 "" if item.get("deviation") is None
                 else " shape %.3f mm" % float(item["deviation"]),
-                "" if item.get("offset") is None
-                else " offset %+.3f mm" % float(item["offset"]),
+                "" if item.get("offset_measured", item.get("offset")) is None
+                else " offset_measured %+.3f mm" % float(
+                    item.get("offset_measured", item.get("offset"))),
+                "" if item.get("shift_predicted") is None
+                else " shift_predicted %+.3f mm" % float(item["shift_predicted"]),
                 "" if not item.get("reason") else " (%s)" % item["reason"]))
         gcmd.respond_info("\n".join(lines))
 
