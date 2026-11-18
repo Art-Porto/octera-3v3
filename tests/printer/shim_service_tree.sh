@@ -37,7 +37,7 @@ cat > "$T/wrapper.sh" <<W
 #!/bin/sh
 : > $T/made_by_plugin
 sleep 1001
-exit $?
+exit \$?
 W
 chmod +x "$T/wrapper.sh"
 cat > "$T/init/S66fakeplugin_service" <<I
