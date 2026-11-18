@@ -64,6 +64,8 @@ def run() -> dict:
     check("PATH holds the system dirs before anything runs",
           text.find('PATH="/bin:/sbin:/usr/bin:/usr/sbin') < text.find("SELF=") < text.find("main()"))
     check("detached restart verifies the service came up", "wait_running" in restart)
+    check("umask 022 is set before any service starts",
+          0 <= text.find("\numask 022\n") < text.find("start() {"))
     check("restart is stop then start (waits for the old tree)",
           0 <= restart.rfind('stop "$service"') < restart.rfind('start "$service"')
           and '"$script_path" restart' not in restart)

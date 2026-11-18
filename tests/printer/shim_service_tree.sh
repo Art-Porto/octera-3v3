@@ -33,8 +33,9 @@ wait_for() { i=0; while [ $i -lt "$2" ]; do eval "$1" && return 0; usleep 100000
 count_progs() { n=0; for s in /proc/[0-9]*/cmdline; do { tr '\0' ' ' < "$s"; } 2>/dev/null | grep -q "^sleep 1001 " && n=$((n + 1)); done; echo $n; }
 
 # --- fake plugin: wrapper sh runs "sleep 1001" as a child ----------------
-cat > "$T/wrapper.sh" <<'W'
+cat > "$T/wrapper.sh" <<W
 #!/bin/sh
+: > $T/made_by_plugin
 sleep 1001
 exit $?
 W
@@ -50,10 +51,13 @@ esac
 I
 chmod +x "$T/init/S66fakeplugin_service"
 
-"$SHIM" start fakeplugin
+( umask 077; "$SHIM" start fakeplugin )   # an SSH shell has umask 0077
 wait_for '[ "$(count_progs)" = 1 ]' 30
 old_wrapper="$(cat "$T/run/fakeplugin.pid")"
 check "plugin started (1 program)" $([ "$(count_progs)" = 1 ]; echo $?)
+wait_for '[ -e "$T/made_by_plugin" ]' 30
+mode="$(ls -l "$T/made_by_plugin" 2>/dev/null | cut -c1-10)"
+check "service started from umask 077 creates files 644" $([ "$mode" = "-rw-r--r--" ]; echo $?) "(got $mode)"
 "$SHIM" restart fakeplugin
 wait_for '[ "$(count_progs)" = 1 ] && [ "$(cat $T/run/fakeplugin.pid)" != "$old_wrapper" ]' 50
 check "plugin restart leaves exactly 1 program" $([ "$(count_progs)" = 1 ]; echo $?) "(found $(count_progs))"

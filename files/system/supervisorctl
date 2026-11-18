@@ -22,6 +22,12 @@
 #
 # SHIM_INIT_DIR / SHIM_RUN_DIR / SHIM_PROC override the system paths (tests).
 
+# Services start with the boot umask, whoever calls. The SSH shell on the
+# 3V3 has umask 0077; a Moonraker started from it (and everything the shim
+# restarted after) created files 600 and dirs 700, and the Fluidd update of
+# 2026-11-17 left /usr/data/fluidd at 700: nginx (www-data) gave 403.
+umask 022
+
 # The caller may run with a reduced PATH (setsid, usleep live in /usr/bin).
 PATH="/bin:/sbin:/usr/bin:/usr/sbin${PATH:+:$PATH}"
 export PATH
